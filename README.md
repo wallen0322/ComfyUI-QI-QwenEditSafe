@@ -3,8 +3,6 @@ ComfyUI-QI-QwenEditSafe
 
 # QI Qwen Image Edit — by wallen0322
 
-**Folder name (don’t change):** `ComfyUI-QI-QwenEditSafe`  
-**Category in node menu:** `QI by wallen0322`
 
 ## 简要说明（中文）
 - 不缩放网格填充，CLIP 与 VAE 同源输入。
