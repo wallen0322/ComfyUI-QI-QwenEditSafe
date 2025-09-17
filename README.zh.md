@@ -5,7 +5,7 @@
 ## 简要说明（中文）
 - 不缩放网格填充，CLIP 与 VAE 同源输入。
 - `reference_pixels` 取自 **VAE 重建**（同域），色彩更稳；`prompt_emphasis` 一个旋钮调"提示词遵从度"。
-- 三个节点：文生图编辑（中文）、TextEncodeQwenImageEdit（英文）、VAE Decode。
+- 两个个节点：TextEncodeQwenImageEdit、VAE Decode。
 
 **快速接线**：`CLIP/图像/VAE` → 文生图编辑 → `(条件, 图像, 潜空间)` → 采样 → VAE Decode。
 
