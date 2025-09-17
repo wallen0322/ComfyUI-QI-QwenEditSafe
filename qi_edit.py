@@ -263,37 +263,6 @@ class QI_TextEncodeQwenImageEdit_Safe:
                 "qi_color":{"mean":src_mean.cpu().numpy().tolist(), "std":src_std.cpu().numpy().tolist()}}
         return (cond, src, latent)
 
-# ----------------- CN mirror -----------------
-class QI_TextEncodeQwenImageEdit_CN:
-    CATEGORY="QI by wallen0322"
-    RETURN_TYPES=("CONDITIONING","IMAGE","LATENT")
-    RETURN_NAMES=("条件","图像","潜空间")
-    FUNCTION="编码"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required":{"CLIP模型":("CLIP",),"提示词":("STRING",{"multiline":True,"default":""}),"图像":("IMAGE",),"VAE":("VAE",)},
-                "optional":{
-                    "模式_不缩放网格填充":("BOOLEAN",{"default":True}),
-                    "填充方式":(["reflect","replicate"],{"default":"reflect"}),
-                    "网格倍数":("INT",{"default":64,"min":8,"max":128,"step":8}),
-                    "注入模式":(["两者都注入","仅latent","仅像素"],{"default":"两者都注入"}),
-                    "编码用FP32":("BOOLEAN",{"default":True}),
-                    "文本优先度":("FLOAT",{"default":0.60,"min":0.0,"max":1.0,"step":0.05}),
-                    "VL像素上限":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536}),
-                }}
-
-    def 编码(self, CLIP模型, 提示词, 图像, VAE,
-           模式_不缩放网格填充=True, 填充方式="reflect", 网格倍数=64,
-           注入模式="两者都注入", 编码用FP32=True, 文本优先度=0.60, VL像素上限=16_777_216):
-
-        core=QI_TextEncodeQwenImageEdit_Safe()
-        imap={"两者都注入":"both","仅latent":"latents","仅像素":"pixels"}
-        return core.encode(CLIP模型, 提示词, 图像, VAE,
-                           no_resize_pad=模式_不缩放网格填充, pad_mode=填充方式, grid_multiple=网格倍数,
-                           inject_mode=imap.get(注入模式,"both"),
-                           encode_fp32=编码用FP32, prompt_emphasis=文本优先度, vl_max_pixels=VL像素上限)
-
 # ----------------- VAE decode (unchanged API) -----------------
 class QI_VAEDecodeHQ:
     CATEGORY="QI by wallen0322"
@@ -341,24 +310,7 @@ class QI_VAEDecodeHQ:
             bhwc=bhwc.cpu().contiguous()
         return (bhwc,)
 
-class QI_VAEDecodeHQ_CN:
-    CATEGORY="QI by wallen0322"
-    RETURN_TYPES=("IMAGE",); RETURN_NAMES=("图像",); FUNCTION="解码"
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required":{"VAE":("VAE",),"潜空间":("LATENT",)},
-                "optional":{"使用FP32":("BOOLEAN",{"default":True}),
-                            "保留原色调":("BOOLEAN",{"default":True}),
-                            "锐化强度":("FLOAT",{"default":0.0,"min":0.0,"max":1.0,"step":0.05}),
-                            "解码移至CPU":("BOOLEAN",{"default":True}),}}
-    def 解码(self, VAE, 潜空间, 使用FP32=True, 保留原色调=True, 锐化强度=0.0, 解码移至CPU=True):
-        core=QI_VAEDecodeHQ()
-        return core.decode(VAE, 潜空间, force_fp32=使用FP32, preserve_color=保留原色调,
-                           unsharp_amount=锐化强度, move_to_cpu=解码移至CPU)
-
 __all__ = [
     "QI_TextEncodeQwenImageEdit_Safe",
-    "QI_TextEncodeQwenImageEdit_CN",
     "QI_VAEDecodeHQ",
-    "QI_VAEDecodeHQ_CN",
 ]

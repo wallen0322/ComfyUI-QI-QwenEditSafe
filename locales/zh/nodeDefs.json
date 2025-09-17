@@ -1,0 +1,63 @@
+{
+  "QI_TextEncodeQwenImageEdit_Safe": {
+    "display_name": "Qwen图像编辑编码器 — by wallen0322",
+    "inputs": {
+      "clip": {
+        "name": "CLIP"
+      },
+      "prompt": {
+        "name": "提示词"
+      },
+      "image": {
+        "name": "图像"
+      },
+      "vae": {
+        "name": "VAE"
+      },
+      "no_resize_pad": {
+        "name": "不缩放填充"
+      },
+      "pad_mode": {
+        "name": "填充模式"
+      },
+      "grid_multiple": {
+        "name": "网格倍数"
+      },
+      "inject_mode": {
+        "name": "注入模式"
+      },
+      "encode_fp32": {
+        "name": "FP32编码"
+      },
+      "prompt_emphasis": {
+        "name": "提示词强调"
+      },
+      "vl_max_pixels": {
+        "name": "VL最大像素"
+      }
+    }
+  },
+  "QI_VAEDecodeHQ": {
+    "display_name": "Qwen高质量VAE解码器 — by wallen0322",
+    "inputs": {
+      "vae": {
+        "name": "VAE"
+      },
+      "latent": {
+        "name": "潜空间"
+      },
+      "force_fp32": {
+        "name": "强制FP32"
+      },
+      "preserve_color": {
+        "name": "保留颜色"
+      },
+      "unsharp_amount": {
+        "name": "锐化强度"
+      },
+      "move_to_cpu": {
+        "name": "移至CPU"
+      }
+    }
+  }
+}
