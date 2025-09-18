@@ -2,15 +2,36 @@
 
 [中文版本](README.zh.md) | English
 
-## Quick Guide (EN)
-- No‑resize grid padding; CLIP & VAE share the same source.
-- `reference_pixels` are **VAE recon** (same domain). Use `prompt_emphasis` to trade text adherence vs. reference strength.
-- Nodes: TextEncodeQwenImageEdit (EN), 文生图编辑 (CN), VAE Decode.
+## Quick Overview (EN)
+- No-resize grid padding; CLIP and VAE share the same source image.
+- `reference_pixels` come from **VAE reconstruction** (same domain) for more stable colors; `prompt_emphasis` is a single knob for text adherence.
+- Nodes: CN Text Edit, **Consistency Edit (RefEdit)**, VAE Decode.
 
-**Wiring**: `CLIP/IMAGE/VAE` → TextEncodeQwenImageEdit → `(conditioning, image, latent)` → sampler → VAE Decode.
+**Quick Wiring**: `CLIP / IMAGE / VAE` → CN Text Edit **or** Consistency Edit (RefEdit) → `(conditioning, image, latent)` → sampler → VAE Decode.
 
-**Key params**:
-- inject_mode: both / latents / pixels (default both)
-- pixels_source: recon (default) / input
-- pixels_shaping: colorfield_64 (default) / colorfield_32 / full
-- prompt_emphasis: 0–1 (default 0.5; ≥0.8 = strong text), enable mild high-frequency boost (radius 5, amount 0.10–0.15), and increase target total pixels when possible.
+**Common Parameters**:
+- Quality mode (RefEdit): natural / fast / balanced / best
+- Injection mode: both / latent only / pixels only (default: both)
+- Pixel source: VAE reconstruction (default) / original image
+- Pixel form: color_field_64 (default) / color_field_32 / full pixels
+- Prompt emphasis: 0–1 (default 0.5; ≥0.8 follows text more)
+
+## Nodes
+
+### QI_TextEncodeQwenImageEdit_Safe
+General text-guided edit encoder. Emphasizes editability while keeping geometry stable via **no-resize grid padding** and **shared CLIP/VAE source**. Use **prompt emphasis** to balance “text adherence ↔ reference stability.”
+
+### QI_RefEditEncode_Safe
+Two-phase consistency edit encoder. Early (0–0.6) focuses on editability; Late (0.6–1.0) reinforces consistency and detail. A thin high-frequency tail around ~0.985–1.0 cleans edges/hair and suppresses artifacts. Provides **quality mode** presets (`natural|fast|balanced|best`) and is Euler / low-CFG friendly by default.
+
+### QI_VAEDecodeHQ
+High-quality VAE decode. Reads `qi_pad` metadata and auto-crops back to the original size. No major changes; pair with either encoder.
+
+## Usage
+Install this package into ComfyUI (place under `custom_nodes`), no extra dependencies required.  
+Two sample workflows are provided: basic editing and ControlNet usage.  
+If you want to use it in your own workflow, just replace **TextEncodeQwenImageEdit** with this node and use **QI_RefEditEncode_Safe** in normal cases; for more exploration, use **QI_TextEncodeQwenImageEdit_Safe** and adjust parameters freely.  
+Note: Add the sentence “保持人物一致性不变，保持画风光影不变” to your prompt for better results.
+
+## Special Thanks
+- Thanks to 封号 (https://civitai.com/user/Futurlunatic) and PT（娃导 https://github.com/ptmaster） for rigorous testing; thanks to PT（娃导） for the idea; thanks to 粘土火星（SaturMars：https://github.com/SaturMars） for technical support; and thanks to the Aiwood 研究院 teammates for their support.
