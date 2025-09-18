@@ -27,5 +27,11 @@
 ### QI_VAEDecodeHQ
 高质量 VAE 解码。读取 `qi_pad` 元数据自动裁回原尺寸。本身无大改，搭配任一编码器即可。
 
+## 使用说明
+安装本节点到comfyui中，可直接下载到custom_nodes目录中，无需额外依赖。
+提供两个示例工作流，基础编辑和controlnet应用，
+如果您想应用到自己工作流只需要替换TextEncodeQwenImageEdit为本节点就可以，正常使用QI_RefEditEncode_Safe即可，如果想探索更多可能性可以使用QI_TextEncodeQwenImageEdit_Safe自由调节参数。
+注意：提示词中需要增加保持人物一致性不变，保持画风光影不变，这句话，效果更佳，
+
 ## 特别感谢
 - 感谢封号（https://civitai.com/user/Futurlunatic） ，PT（娃导https://github.com/ptmaster） 两位大佬的辛苦测试，感谢PT（娃导）的思路，感谢粘土火星（SaturMars：https://github.com/SaturMars）  提供技术支持，感谢Aiwood研究院小伙伴们的支持。
