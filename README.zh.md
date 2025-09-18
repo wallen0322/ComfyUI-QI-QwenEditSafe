@@ -28,4 +28,4 @@
 高质量 VAE 解码。读取 `qi_pad` 元数据自动裁回原尺寸。本身无大改，搭配任一编码器即可。
 
 ## 特别感谢
-- 感谢封号，PT（娃导）两位大佬的辛苦测试，感谢PT（娃导）的思路，感谢粘土火星（SaturMars：https://github.com/SaturMars）  提供技术支持，感谢Aiwood研究院小伙伴们的支持。
+- 感谢封号（https://civitai.com/user/Futurlunatic），PT（娃导https://github.com/ptmaster） 两位大佬的辛苦测试，感谢PT（娃导）的思路，感谢粘土火星（SaturMars：https://github.com/SaturMars）  提供技术支持，感谢Aiwood研究院小伙伴们的支持。
