@@ -1,9 +1,18 @@
 {
   "QI_TextEncodeQwenImageEdit_Safe": {
     "display_name": "Qwen图像编辑编码器 — by wallen0322",
+    "category": "QI by wallen0322"
+  },
+  "QI_VAEDecodeHQ": {
+    "display_name": "Qwen高质量VAE解码器 — by wallen0322",
+    "category": "QI by wallen0322"
+  },
+  "QI_RefEditEncode_Safe": {
+    "display_name": "Qwen一致性编辑编码器 — by wallen0322",
+    "category": "QI by wallen0322",
     "inputs": {
       "clip": {
-        "name": "CLIP"
+        "name": "CLIP 编码器"
       },
       "prompt": {
         "name": "提示词"
@@ -14,49 +23,22 @@
       "vae": {
         "name": "VAE"
       },
-      "no_resize_pad": {
-        "name": "不缩放填充"
-      },
-      "pad_mode": {
-        "name": "填充模式"
-      },
-      "grid_multiple": {
-        "name": "网格倍数"
-      },
-      "inject_mode": {
-        "name": "注入模式"
-      },
-      "encode_fp32": {
-        "name": "FP32编码"
-      },
       "prompt_emphasis": {
-        "name": "提示词强调"
+        "name": "文本优先度"
       },
-      "vl_max_pixels": {
-        "name": "VL最大像素"
+      "quality_mode": {
+        "name": "质量模式"
       }
-    }
-  },
-  "QI_VAEDecodeHQ": {
-    "display_name": "Qwen高质量VAE解码器 — by wallen0322",
-    "inputs": {
-      "vae": {
-        "name": "VAE"
+    },
+    "outputs": {
+      "conditioning": {
+        "name": "条件"
+      },
+      "image": {
+        "name": "图像"
       },
       "latent": {
         "name": "潜空间"
-      },
-      "force_fp32": {
-        "name": "强制FP32"
-      },
-      "preserve_color": {
-        "name": "保留颜色"
-      },
-      "unsharp_amount": {
-        "name": "锐化强度"
-      },
-      "move_to_cpu": {
-        "name": "移至CPU"
       }
     }
   }
