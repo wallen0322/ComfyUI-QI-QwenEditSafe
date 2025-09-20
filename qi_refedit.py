@@ -86,38 +86,130 @@ def _apply_vl_cap(img_bhwc: torch.Tensor) -> torch.Tensor:
     Ws = max(1, int(Wt * scale))
     return _ensure_rgb3(_resize_bchw_smart(_bchw(img_bhwc), Ws, Hs).movedim(1, -1))
 
+def _smoothstep(a: float, b: float, x: torch.Tensor) -> torch.Tensor:
+    t = ((x - a) / max(1e-6, (b - a)))
+    t = t.clamp(0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+def _srgb_to_linear(t: torch.Tensor) -> torch.Tensor:
+    t = t.clamp(0.0, 1.0)
+    return torch.where(t <= 0.04045, t / 12.92, ((t + 0.055) / 1.055) ** 2.4)
+
+def _linear_to_srgb(t: torch.Tensor) -> torch.Tensor:
+    t = t.clamp(0.0, 1.0)
+    return torch.where(t <= 0.0031308, t * 12.92, 1.055 * torch.pow(t, 1.0 / 2.4) - 0.055)
+
+def _batched_cov_2x2(Cb: torch.Tensor, Cr: torch.Tensor, mask: torch.Tensor):
+    # Cb/Cr/Mask: Bx1xHxW (float)
+    eps = 1e-6
+    B, _, H, W = Cb.shape
+    m = mask.float()
+    denom = m.sum(dim=(2,3), keepdim=True).clamp_min(1.0)
+    mu_cb = (Cb * m).sum(dim=(2,3), keepdim=True) / denom
+    mu_cr = (Cr * m).sum(dim=(2,3), keepdim=True) / denom
+    dc_b = (Cb - mu_cb) * m
+    dc_r = (Cr - mu_cr) * m
+    var_cb = (dc_b * (Cb - mu_cb)).sum(dim=(2,3), keepdim=True) / denom + eps
+    var_cr = (dc_r * (Cr - mu_cr)).sum(dim=(2,3), keepdim=True) / denom + eps
+    cov_br = (dc_b * (Cr - mu_cr)).sum(dim=(2,3), keepdim=True) / denom
+    # Pack Bx2x2
+    C = torch.zeros((B, 2, 2), dtype=Cb.dtype, device=Cb.device)
+    C[:,0,0] = var_cb.squeeze()
+    C[:,1,1] = var_cr.squeeze()
+    C[:,0,1] = cov_br.squeeze()
+    C[:,1,0] = cov_br.squeeze()
+    mu = torch.cat([mu_cb, mu_cr], dim=1)  # Bx2x1x1
+    return mu, C
+
+def _sym_sqrtm_2x2(C: torch.Tensor):
+    # C: Bx2x2 SPD
+    eps = 1e-6
+    w, V = torch.linalg.eigh(C)  # Bx2, Bx2x2
+    w = w.clamp_min(eps)
+    sqrtw = torch.sqrt(w)
+    invsqrtw = 1.0 / sqrtw
+    S = V @ torch.diag_embed(sqrtw) @ V.transpose(-1, -2)
+    Sinv = V @ torch.diag_embed(invsqrtw) @ V.transpose(-1, -2)
+    return S, Sinv
+
+def _apply_chroma_whiten_color(Cb_x, Cr_x, Cb_r, Cr_r, Y_lin):
+    # Inputs: Bx1xHxW tensors (linear domain)
+    # Build midtone mask for robust stats (avoid deep shadow / near-white)
+    B, _, H, W = Y_lin.shape
+    yvec = Y_lin.reshape(B, 1, H*W)
+    lo = torch.quantile(yvec, 0.06, dim=-1, keepdim=True).reshape(B,1,1,1)
+    hi = torch.quantile(yvec, 0.94, dim=-1, keepdim=True).reshape(B,1,1,1)
+    mask = (Y_lin >= lo) & (Y_lin <= hi)
+
+    mu_x, Cx = _batched_cov_2x2(Cb_x, Cr_x, mask)
+    mu_r, Cr = _batched_cov_2x2(Cb_r, Cr_r, mask)
+
+    S_r, _ = _sym_sqrtm_2x2(Cr)
+    _, Sinv_x = _sym_sqrtm_2x2(Cx)
+    # T: Bx2x2
+    T = S_r @ Sinv_x
+
+    # Clamp singular values of T to near-identity (±3%)
+    U, S, Vh = torch.linalg.svd(T)
+    S = S.clamp(0.97, 1.03)
+    T = U @ torch.diag_embed(S) @ Vh
+
+    # Shift clamp ±0.004
+    dmu = (mu_r - mu_x)  # Bx2x1x1
+    dmu = dmu.clamp(-0.004, 0.004)
+
+    # Apply to each pixel: v' = T (v - mu_x) + (mu_x + dmu)
+    B,_,H,W = Cb_x.shape
+    v = torch.cat([Cb_x, Cr_x], dim=1).reshape(B, 2, H*W)        # Bx2xN
+    mu_x2 = mu_x.reshape(B, 2, 1)
+    dmu2 = dmu.reshape(B, 2, 1)
+    vp = (T @ (v - mu_x2)) + (mu_x2 + dmu2)                     # Bx2xN
+    Cb_p = vp[:,0].reshape(B,1,H,W)
+    Cr_p = vp[:,1].reshape(B,1,H,W)
+    return Cb_p, Cr_p
+
 def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float = 0.97) -> torch.Tensor:
-    x = _bchw(_ensure_rgb3(x_bhwc))
-    r = _bchw(_ensure_rgb3(ref_bhwc))
-    R, G, B = x[:, 0:1], x[:, 1:2], x[:, 2:3]
-    Yx = 0.299 * R + 0.587 * G + 0.114 * B
-    Cbx = (B - Yx) * 0.564
-    Crx = (R - Yx) * 0.713
-    Rr, Gr, Br = r[:, 0:1], r[:, 1:2], r[:, 2:3]
-    Yr = 0.299 * Rr + 0.587 * Gr + 0.114 * Br
-    Cbr = (Br - Yr) * 0.564
-    Crr = (Rr - Yr) * 0.713
-    cbx_mu = Cbx.mean(dim=(2, 3), keepdim=True)
-    cbx_std = Cbx.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
-    crx_mu = Crx.mean(dim=(2, 3), keepdim=True)
-    crx_std = Crx.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
-    cbr_mu = Cbr.mean(dim=(2, 3), keepdim=True)
-    cbr_std = Cbr.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
-    crr_mu = Crr.mean(dim=(2, 3), keepdim=True)
-    crr_std = Crr.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
-    cb_scale = (cbr_std / cbx_std).clamp(0.99, 1.01)
-    cr_scale = (crr_std / crx_std).clamp(0.99, 1.01)
-    cb_shift = (cbr_mu - cbx_mu).clamp(-0.004, 0.004)
-    cr_shift = (crr_mu - crx_mu).clamp(-0.004, 0.004)
-    Cb_aligned = (Cbx - cbx_mu) * cb_scale + cbx_mu + cb_shift
-    Cr_aligned = (Crx - crx_mu) * cr_scale + crx_mu + cr_shift
-    Y_aligned = Yx
-    R2 = (Y_aligned + 1.403 * Cr_aligned).clamp(0, 1)
-    G2 = (Y_aligned - 0.344 * Cb_aligned - 0.714 * Cr_aligned).clamp(0, 1)
-    B2 = (Y_aligned + 1.773 * Cb_aligned).clamp(0, 1)
-    aligned = torch.cat([R2, G2, B2], dim=1)
-    y = (mix * aligned + (1.0 - mix) * x).movedim(1, -1)
-    return _ensure_rgb3(y)
+    # 1) To linear domain
+    x_srgb = _bchw(_ensure_rgb3(x_bhwc))
+    r_srgb = _bchw(_ensure_rgb3(ref_bhwc))
+    x_lin = _srgb_to_linear(x_srgb)
+    r_lin = _srgb_to_linear(r_srgb)
+
+    R, G, B = x_lin[:,0:1], x_lin[:,1:2], x_lin[:,2:3]
+    Rr, Gr, Br = r_lin[:,0:1], r_lin[:,1:2], r_lin[:,2:3]
+
+    # 2) BT.709 luminance (linear)
+    Yx = 0.2126 * R + 0.7152 * G + 0.0722 * B
+    Yr = 0.2126 * Rr + 0.7152 * Gr + 0.0722 * Br
+
+    # BT.709 chroma scales
+    cb_s = 0.5 / (1.0 - 0.0722)
+    cr_s = 0.5 / (1.0 - 0.2126)
+
+    Cbx = (B - Yx) * cb_s
+    Crx = (R - Yx) * cr_s
+    Cbr = (Br - Yr) * cb_s
+    Crr = (Rr - Yr) * cr_s
+
+    # 3) Chroma match via whiten->color (tiny-clamped) on midtones
+    Cb_aligned, Cr_aligned = _apply_chroma_whiten_color(Cbx, Crx, Cbr, Crr, Yx)
+
+    # 4) Luminance-preserving reconstruction (linear)
+    inv_cb = 1.0 / cb_s
+    inv_cr = 1.0 / cr_s
+    R2 = (Yx + Cr_aligned * inv_cr)
+    B2 = (Yx + Cb_aligned * inv_cb)
+    G2 = (Yx - 0.2126 * R2 - 0.0722 * B2) / 0.7152
+    aligned_lin = torch.cat([R2, G2, B2], dim=1).clamp(0, 1)
+
+    # 5) Highlight/shadow attenuation for the blend
+    w_hi = 1.0 - _smoothstep(0.75, 0.98, Yx)
+    w_lo = _smoothstep(0.05, 0.12, Yx)
+    w = (mix * w_hi * w_lo).clamp(0.0, 1.0)
+
+    out_lin = w * aligned_lin + (1.0 - w) * x_lin
+    out_srgb = _linear_to_srgb(out_lin).movedim(1, -1)
+    return _ensure_rgb3(out_srgb)
 
 def _lowpass_ref(bhwc: torch.Tensor, size: int = 64) -> torch.Tensor:
     bchw = _bchw(bhwc)
