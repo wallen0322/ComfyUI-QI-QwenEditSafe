@@ -1,45 +1,52 @@
 {
   "QI_TextEncodeQwenImageEdit_Safe": {
     "display_name": "Qwen图像编辑编码器 — by wallen0322",
-    "category": "QI by wallen0322"
-  },
-  "QI_VAEDecodeHQ": {
-    "display_name": "Qwen高质量VAE解码器 — by wallen0322",
-    "category": "QI by wallen0322"
+    "category": "QI by wallen0322",
+    "input": {
+      "clip": "CLIP模型",
+      "prompt": "提示词",
+      "image": "输入图像",
+      "vae": "VAE",
+      "out_width": "输出宽度",
+      "out_height": "输出高度",
+      "prompt_emphasis": "提示词权重"
+    },
+    "output": {
+      "conditioning": "条件",
+      "image": "图像",
+      "latent": "潜空间"
+    }
   },
   "QI_RefEditEncode_Safe": {
     "display_name": "Qwen一致性编辑编码器 — by wallen0322",
     "category": "QI by wallen0322",
-    "inputs": {
-      "clip": {
-        "name": "CLIP 编码器"
-      },
-      "prompt": {
-        "name": "提示词"
-      },
-      "image": {
-        "name": "图像"
-      },
-      "vae": {
-        "name": "VAE"
-      },
-      "prompt_emphasis": {
-        "name": "文本优先度"
-      },
-      "quality_mode": {
-        "name": "质量模式"
-      }
+    "input": {
+      "clip": "CLIP模型",
+      "prompt": "提示词",
+      "image": "输入图像",
+      "vae": "VAE",
+      "out_width": "输出宽度",
+      "out_height": "输出高度",
+      "prompt_emphasis": "提示词权重",
+      "quality_mode": "质量模式"
     },
-    "outputs": {
-      "conditioning": {
-        "name": "条件"
-      },
-      "image": {
-        "name": "图像"
-      },
-      "latent": {
-        "name": "潜空间"
-      }
+    "output": {
+      "conditioning": "条件",
+      "image": "图像",
+      "latent": "潜空间"
+    }
+  },
+  "QI_VAEDecodeLockSize": {
+    "display_name": "Qwen VAE 解码（尺寸锁定裁回） — by wallen0322",
+    "category": "QI by wallen0322",
+    "input": {
+      "vae": "VAE",
+      "latent": "潜空间",
+      "force_fp32": "强制FP32",
+      "move_to_cpu": "解码后移至CPU"
+    },
+    "output": {
+      "image": "图像"
     }
   }
 }
