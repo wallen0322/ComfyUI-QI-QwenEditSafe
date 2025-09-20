@@ -2,6 +2,32 @@
 
 中文版本 | [English](README.md)
 
+## 更新日志（中文）
+**本次更新的两个节点**
+2025/0921
+
+1) **QI_TextEncodeQwenImageEdit_Safe（图像编辑编码器）**  
+- **作用**：将 *提示词+输入图像+VAE* 编码为采样所需的 *conditioning / image / latent*，用于**文字/视觉混合驱动的编辑**。  
+- **要点用法**：  
+  - `no_resize_pad`：不重采样，仅做信箱式填充，**保持像素一致性**。  
+  - `pad_mode` / `grid_multiple`：控制填充方式与网格对齐，减少边缘伪影。  
+  - `inject_mode`：控制像素参考注入策略；默认即可。  
+  - `encode_fp32`：显存允许时开启，提升稳定性。  
+  - `prompt_emphasis`：调“听词”力度（建议 0.4–0.7）。  
+  - `vl_max_pixels`：视觉输入上限（1.4MP）自动限流。  
+- **连接**：输出的 *conditioning/image/latent* 直接接采样器（KSampler 等）。
+
+2) **QI_RefEditEncode_Safe（一致性编辑编码器）**  
+- **作用**：针对**一致性要求高**的编辑（人像/产品/版式等），在保持主体与视感稳定的同时，减少颜色漂移与高光丢层次。  
+- **要点用法**：  
+  - `out_width/out_height`：**先拉齐输出分辨率**；内部按 32 倍数计算，解码后自动裁回，**像素一一对齐**。  
+  - `quality_mode`：`fast / balanced / best / natural` 四挡，平衡速度与质量。  
+  - `prompt_emphasis`：只影响**像素参考的收敛强度**，latent 锁脸不变。  
+  - 内置 **Linear BT.709 色度对齐 + 亮/暗端衰减**，缓解亮场偏绿/高光顶白；计算上限 3MP，稳定兼容。  
+- **连接**：同上，输出直接接采样器；`latent` 内含 `qi_pad` 元信息，供后续解码裁回原设尺寸。
+
+---
+
 ## 简要说明（中文）
 - 不缩放网格填充，CLIP 与 VAE 同源输入。
 - `reference_pixels` 取自 **VAE 重建**（同域），色彩更稳；`prompt_emphasis` 一个旋钮调"提示词遵从度"。
