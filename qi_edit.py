@@ -121,8 +121,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                     "clip":("CLIP",),
                     "prompt":("STRING",{"multiline":True,"default":""}),
                     "image":("IMAGE",),
-                    "vae":("VAE",),
-                },
+                    "vae":("VAE",)},
                 "optional":{
                     "no_resize_pad":("BOOLEAN",{"default":True}),
                     "pad_mode":(["reflect","replicate"],{"default":"reflect"}),
@@ -130,8 +129,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                     "inject_mode":(["both","latents","pixels"],{"default":"both"}),
                     "encode_fp32":("BOOLEAN",{"default":True}),
                     "prompt_emphasis":("FLOAT",{"default":0.60,"min":0.0,"max":1.0,"step":0.05}),
-                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536}),
-                }}
+                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536})}}
 
     # --- adaptive schedule (multi-scale pixel anchoring) ---
     def _derive_schedule(self, emph: float, prompt: str, H:int, W:int) -> Dict[str, Any]:
@@ -165,37 +163,8 @@ class QI_TextEncodeQwenImageEdit_Safe:
             "lat_range":[0.0, float(lat_end)], "lat_w":float(w_lat), "lat_rep":int(lat_rep),
             "pixE_range": pix_early, "pixE_w": float(w_pix_e),
             "pixM_range": pix_mid,   "pixM_w": float(w_pix_m), "pix_rep":int(pix_rep),
-            "pixL_range": pix_late,  "pixL_w": float(w_pix_l),
-        }
+            "pixL_range": pix_late,  "pixL_w": float(w_pix_l)}
 
-    def _derive_schedule(self, prompt_emphasis, prompt=None, H=None, W=None):
-            e = max(0.0, min(1.0, float(prompt_emphasis)))
-            lat_range  = [0.00, 0.36]
-            pixE_range = [0.30, 0.52]  # LF
-            pixM_range = [0.52, 0.78]  # MF
-            pixL_range = [0.86, 1.00]  # HF
-        
-            lat_w  = max(0.90, min(1.45, 0.90 + 0.55*e))
-            pixE_w = max(0.20, min(0.40, 0.40 - 0.20*e))
-            pixM_w = max(0.40, min(0.70, 0.70 - 0.30*e))
-            pixL_w = max(0.12, min(0.30, 0.12 + 0.18*e))
-        
-            lat_rep = 2 if e >= 0.70 else 1
-            pix_rep = 1
-        
-            # Backward-compat aliases (if caller expects a single pixel band):
-            pix_range = pixM_range
-            pix_w = pixM_w
-        
-            return {
-                "lat_range": lat_range, "lat_w": float(lat_w), "lat_rep": int(lat_rep),
-                "pixE_range": pixE_range, "pixE_w": float(pixE_w),
-                "pixM_range": pixM_range, "pixM_w": float(pixM_w),
-                "pixL_range": pixL_range, "pixL_w": float(pixL_w),
-                "pix_rep": int(pix_rep),
-                # aliases:
-                "pix_range": pix_range, "pix_w": float(pix_w),
-            }
     def encode(self, clip, prompt, image, vae,
                no_resize_pad=True, pad_mode="reflect", grid_multiple=64,
                inject_mode="both", encode_fp32=True, prompt_emphasis=0.60,
@@ -292,53 +261,5 @@ class QI_TextEncodeQwenImageEdit_Safe:
         return (cond, src, latent)
 
 # ----------------- VAE decode (unchanged API) -----------------
-class QI_VAEDecodeHQ:
-    CATEGORY="QI by wallen0322"
-    RETURN_TYPES=("IMAGE",); RETURN_NAMES=("image",); FUNCTION="decode"
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required":{"vae":("VAE",),"latent":("LATENT",)},
-                "optional":{"force_fp32":("BOOLEAN",{"default":True}),
-                            "preserve_color":("BOOLEAN",{"default":True}),
-                            "unsharp_amount":("FLOAT",{"default":0.0,"min":0.0,"max":1.0,"step":0.05}),
-                            "move_to_cpu":("BOOLEAN",{"default":True}),}}
-    def _unsharp(self, bchw: torch.Tensor, amt: float)->torch.Tensor:
-        if amt<=0: return bchw
-        k=torch.tensor([[0,-1,0],[-1,5,-1],[0,-1,0]],dtype=bchw.dtype,device=bchw.device).view(1,1,3,3)
-        C=bchw.shape[1]; k=k.repeat(C,1,1,1)
-        pad=1; x=F.pad(bchw,(pad,pad,pad,pad),mode="reflect")
-        return (1-amt)*bchw + amt*F.conv2d(x,k,groups=C)
-    def decode(self, vae, latent, force_fp32=True, preserve_color=True, unsharp_amount=0.0, move_to_cpu=True):
-        x=latent["samples"]
-        if force_fp32 and isinstance(x,torch.Tensor) and x.dtype!=torch.float32: x=x.float()
-        with torch.inference_mode():
-            img=vae.decode(x)
-        if isinstance(img,(list,tuple)): img=img[0]
-        bchw=_bchw(img).movedim(-1,1).contiguous()
-        if float(unsharp_amount)>0:
-            bchw=self._unsharp(bchw, float(unsharp_amount))
-        bhwc=_ensure_rgb3(bchw.movedim(1,-1)).clamp(0,1)
-        meta=latent.get("qi_pad",None)
-        if meta:
-            top,bottom,left,right=int(meta.get("top",0)),int(meta.get("bottom",0)),int(meta.get("left",0)),int(meta.get("right",0))
-            if (top+bottom+left+right)>0:
-                H,W=bhwc.shape[1],bhwc.shape[2]
-                ys=max(0,min(H,top)); ye=max(ys,min(H,H-bottom))
-                xs=max(0,min(W,left)); xe=max(xs,min(W,W-right))
-                bhwc=bhwc[:,ys:ye,xs:xe,:]
-            H0,W0=int(meta.get("orig_h",bhwc.shape[1])),int(meta.get("orig_w",bhwc.shape[2]))
-            bhwc=bhwc[:,:max(1,H0),:max(1,W0),:]
-        if preserve_color:
-            stats=latent.get("qi_color",None)
-            if stats and "mean" in stats and "std" in stats:
-                ref_mean=torch.tensor(stats["mean"],dtype=bhwc.dtype,device=bhwc.device)
-                ref_std=torch.tensor(stats["std"],dtype=bhwc.dtype,device=bhwc.device)
-                bhwc=_match_color(bhwc, ref_mean, ref_std)
-        if move_to_cpu:
-            bhwc=bhwc.cpu().contiguous()
-        return (bhwc,)
 
-__all__ = [
-    "QI_TextEncodeQwenImageEdit_Safe",
-    "QI_VAEDecodeHQ",
-]
+__all__ = ["QI_TextEncodeQwenImageEdit_Safe"]
