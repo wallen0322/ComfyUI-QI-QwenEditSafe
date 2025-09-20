@@ -121,8 +121,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                     "clip":("CLIP",),
                     "prompt":("STRING",{"multiline":True,"default":""}),
                     "image":("IMAGE",),
-                    "vae":("VAE",),
-                },
+                    "vae":("VAE",)},
                 "optional":{
                     "no_resize_pad":("BOOLEAN",{"default":True}),
                     "pad_mode":(["reflect","replicate"],{"default":"reflect"}),
@@ -130,8 +129,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                     "inject_mode":(["both","latents","pixels"],{"default":"both"}),
                     "encode_fp32":("BOOLEAN",{"default":True}),
                     "prompt_emphasis":("FLOAT",{"default":0.60,"min":0.0,"max":1.0,"step":0.05}),
-                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536}),
-                }}
+                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536})}}
 
     # --- adaptive schedule (multi-scale pixel anchoring) ---
     def _derive_schedule(self, emph: float, prompt: str, H:int, W:int) -> Dict[str, Any]:
@@ -165,37 +163,8 @@ class QI_TextEncodeQwenImageEdit_Safe:
             "lat_range":[0.0, float(lat_end)], "lat_w":float(w_lat), "lat_rep":int(lat_rep),
             "pixE_range": pix_early, "pixE_w": float(w_pix_e),
             "pixM_range": pix_mid,   "pixM_w": float(w_pix_m), "pix_rep":int(pix_rep),
-            "pixL_range": pix_late,  "pixL_w": float(w_pix_l),
-        }
+            "pixL_range": pix_late,  "pixL_w": float(w_pix_l)}
 
-    def _derive_schedule(self, prompt_emphasis, prompt=None, H=None, W=None):
-            e = max(0.0, min(1.0, float(prompt_emphasis)))
-            lat_range  = [0.00, 0.36]
-            pixE_range = [0.30, 0.52]  # LF
-            pixM_range = [0.52, 0.78]  # MF
-            pixL_range = [0.86, 1.00]  # HF
-        
-            lat_w  = max(0.90, min(1.45, 0.90 + 0.55*e))
-            pixE_w = max(0.20, min(0.40, 0.40 - 0.20*e))
-            pixM_w = max(0.40, min(0.70, 0.70 - 0.30*e))
-            pixL_w = max(0.12, min(0.30, 0.12 + 0.18*e))
-        
-            lat_rep = 2 if e >= 0.70 else 1
-            pix_rep = 1
-        
-            # Backward-compat aliases (if caller expects a single pixel band):
-            pix_range = pixM_range
-            pix_w = pixM_w
-        
-            return {
-                "lat_range": lat_range, "lat_w": float(lat_w), "lat_rep": int(lat_rep),
-                "pixE_range": pixE_range, "pixE_w": float(pixE_w),
-                "pixM_range": pixM_range, "pixM_w": float(pixM_w),
-                "pixL_range": pixL_range, "pixL_w": float(pixL_w),
-                "pix_rep": int(pix_rep),
-                # aliases:
-                "pix_range": pix_range, "pix_w": float(pix_w),
-            }
     def encode(self, clip, prompt, image, vae,
                no_resize_pad=True, pad_mode="reflect", grid_multiple=64,
                inject_mode="both", encode_fp32=True, prompt_emphasis=0.60,
@@ -292,4 +261,5 @@ class QI_TextEncodeQwenImageEdit_Safe:
         return (cond, src, latent)
 
 # ----------------- VAE decode (unchanged API) -----------------
-__all__ = ["QI_TextEncodeQwenImageEdit_Safe",]
+
+__all__ = ["QI_TextEncodeQwenImageEdit_Safe"]
