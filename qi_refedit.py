@@ -312,7 +312,7 @@ class QI_RefEditEncode_Safe:
             if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
             if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
 
-        # schedule weights (unchanged behavior)
+        # schedule weights (quality presets)
         emph = float(max(0.0, min(1.0, prompt_emphasis)))
         if quality_mode == "fast":
             lat_e, pixM_e, pixE_e = 0.68, 0.42, 0.20; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.02; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
@@ -323,8 +323,18 @@ class QI_RefEditEncode_Safe:
         else:
             lat_e, pixM_e, pixE_e = 0.73, 0.49, 0.24; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.025; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
 
+        # global scale by prompt_emphasis (keep latent always-locked)
         ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
         pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
+
+        # ---- two-step adherence: early "more prompt", late "more consistency" ----
+        e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
+        l_mult = max(0.75, min(1.15, 0.75 + 0.40 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency
+
+        pixE_e *= e_mult
+        pixM_e *= 0.85 * e_mult
+        pixM_l *= l_mult
+        pixL_l *= 1.15 * l_mult   # only used in late hf range
 
         # build references
         pixM = padded if (pixM_e>0 or pixM_l>0) else None
