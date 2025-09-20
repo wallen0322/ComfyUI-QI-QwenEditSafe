@@ -2,6 +2,29 @@
 
 [中文版本](README.zh.md) | English
 
+**Updated Nodes**
+
+1) **QI_TextEncodeQwenImageEdit_Safe (Image Edit Encoder)**  
+- **Purpose**: Encode *prompt + input image + VAE* into *conditioning / image / latent* for text–vision mixed editing.  
+- **How to use**:  
+  - `no_resize_pad`: letterbox-only (no resample) to **preserve pixel consistency**.  
+  - `pad_mode` / `grid_multiple`: control padding and grid alignment to reduce edge artifacts.  
+  - `inject_mode`: pixel-reference injection strategy (defaults are fine).  
+  - `encode_fp32`: enable if VRAM allows for stability.  
+  - `prompt_emphasis`: strength of prompt adherence (suggest 0.4–0.7).  
+  - `vl_max_pixels`: CLIP-vision cap (1.4MP) auto-throttled.  
+- **Wiring**: feed outputs directly into your sampler (e.g., KSampler).
+
+2) **QI_RefEditEncode_Safe (Consistency Edit Encoder)**  
+- **Purpose**: High-consistency editing (portraits, products, layout) with reduced color drift and preserved highlight/shadow detail.  
+- **How to use**:  
+  - `out_width/out_height`: **lock output size first**; the pipeline computes at 32× alignment and crops back, giving **pixel-perfect alignment**.  
+  - `quality_mode`: choose among `fast / balanced / best / natural` for speed/quality trade-off.  
+  - `prompt_emphasis`: affects **only pixel-reference convergence**; latent lock remains.  
+  - Built-in **Linear BT.709 chroma match + highlight/lowlight attenuation** to mitigate bright-scene green shift & highlight clipping; 3MP compute cap for stability.  
+- **Wiring**: same—pipe *conditioning/image/latent* to the sampler; `latent.qi_pad` carries crop metadata for final decoding.
+
+
 ## Quick Overview (EN)
 - No-resize grid padding; CLIP and VAE share the same source image.
 - `reference_pixels` come from **VAE reconstruction** (same domain) for more stable colors; `prompt_emphasis` is a single knob for text adherence.
