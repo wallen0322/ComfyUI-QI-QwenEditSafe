@@ -2,49 +2,56 @@
   "QI_TextEncodeQwenImageEdit_Safe": {
     "display_name": "Qwen图像编辑编码器 — by wallen0322",
     "category": "QI by wallen0322",
-    "input": {
-      "required": {
-        "clip": "CLIP 模型",
-        "prompt": "提示词",
-        "image": "输入图像",
-        "vae": "VAE"
-      },
-      "optional": {
-        "no_resize_pad": "不重采样，仅填充",
-        "pad_mode": "填充方式",
-        "grid_multiple": "网格对齐倍数",
-        "inject_mode": "参考注入模式",
-        "encode_fp32": "编码使用 FP32",
-        "prompt_emphasis": "提示词权重",
-        "vl_max_pixels": "视觉输入像素上限"
-      }
+    "inputs": {
+      "clip": { "name": "CLIP 模型", "tooltip": "用于文本/视觉编码的 CLIP" },
+      "prompt": { "name": "提示词", "tooltip": "引导编辑的文本提示" },
+      "image": { "name": "输入图像", "tooltip": "要编辑的源图像" },
+      "vae": { "name": "VAE", "tooltip": "用于潜空间编码/解码" },
+
+      "no_resize_pad": { "name": "不重采样，仅填充", "tooltip": "保持分辨率不变，仅做信箱式填充" },
+      "pad_mode": { "name": "填充方式", "tooltip": "边缘填充模式（reflect/replicate）" },
+      "grid_multiple": { "name": "网格对齐倍数", "tooltip": "将分辨率对齐到该倍数以减少伪影" },
+      "inject_mode": { "name": "参考注入模式", "tooltip": "选择注入 latent、像素或两者（both/latents/pixels）" },
+      "encode_fp32": { "name": "编码使用 FP32", "tooltip": "在显存允许时使用 FP32 提升稳定性" },
+      "vl_max_pixels": { "name": "视觉输入像素上限", "tooltip": "限制视觉分支输入像素数量以控内存" },
+      "system_template": { "name": "提示词框架（Qwen2.5VL）", "tooltip": "用于统一并增强提示词的系统模板（可自定义）" }
     },
-    "output": {
-      "conditioning": "条件",
-      "image": "图像",
-      "latent": "潜空间"
+    "outputs": {
+      "0": { "name": "条件", "tooltip": "条件（conditioning）" },
+      "1": { "name": "图像", "tooltip": "输出图像" },
+      "2": { "name": "潜空间", "tooltip": "潜空间（latent）" }
     }
   },
   "QI_RefEditEncode_Safe": {
     "display_name": "Qwen — 一致性编辑编码器 — by wallen0322",
     "category": "QI by wallen0322",
-    "input": {
-      "required": {
-        "clip": "CLIP 模型",
-        "prompt": "提示词",
-        "image": "输入图像",
-        "vae": "VAE",
-        "out_width": "输出宽度",
-        "out_height": "输出高度",
-        "prompt_emphasis": "提示词权重",
-        "quality_mode": "质量模式"
-      },
-      "optional": {}
+    "inputs": {
+      "clip": { "name": "CLIP 模型", "tooltip": "用于文本/视觉编码的 CLIP" },
+      "prompt": { "name": "提示词", "tooltip": "引导一致性编辑的文本提示" },
+      "image": { "name": "输入图像", "tooltip": "要编辑的源图像" },
+      "vae": { "name": "VAE", "tooltip": "用于潜空间编码/解码" },
+      "out_width": { "name": "输出宽度", "tooltip": "目标输出宽度（对齐后自动裁回）" },
+      "out_height": { "name": "输出高度", "tooltip": "目标输出高度（对齐后自动裁回）" },
+      "prompt_emphasis": { "name": "提示词权重", "tooltip": "调节文本遵从度（仅影响像素参考收敛）" },
+      "quality_mode": { "name": "质量模式", "tooltip": "质量/速度预设（natural/fast/balanced/best）" }
     },
-    "output": {
-      "conditioning": "条件",
-      "image": "图像",
-      "latent": "潜空间"
+    "outputs": {
+      "0": { "name": "条件", "tooltip": "条件（conditioning）" },
+      "1": { "name": "图像", "tooltip": "输出图像" },
+      "2": { "name": "潜空间", "tooltip": "潜空间（latent）" }
+    }
+  },
+  "QI_VAEDecodeLockSize": {
+    "display_name": "Qwen VAE 解码（尺寸锁定裁回） — by wallen0322",
+    "category": "QI by wallen0322",
+    "inputs": {
+      "vae": { "name": "VAE", "tooltip": "用于潜空间解码" },
+      "latent": { "name": "潜空间", "tooltip": "包含 samples 与元信息（qi_pad等）" },
+      "force_fp32": { "name": "强制 FP32", "tooltip": "将解码输入转换为 FP32 以提稳" },
+      "move_to_cpu": { "name": "移动到 CPU", "tooltip": "将结果移回 CPU" }
+    },
+    "outputs": {
+      "0": { "name": "图像", "tooltip": "解码后的图像（自动裁回原尺寸）" }
     }
   }
 }
