@@ -7,6 +7,24 @@
 
 2025/0921
 
+## 新增 / What's New
+- **Qwen 2.5 VL 专用加载器（包装） — `QI_QwenVLClipWrapper`**
+  - 作用：稳定 VL 视觉输入（几何/分辨率/颜色暗示），提升颜色与一致性稳定性。
+
+## 用法 / Usage
+1) 工作流中：**官方“加载 CLIP（qwen_image）” → 本节点 → 你的编辑编码器**（`clip` 口对接）。
+2) 不改其他节点；仅在本节点按场景切换参数。
+
+## 参数组合 / Quick Recipes
+- **近景人像**：`geometry=center_crop` · `fixed_size=672` · `color_mode=grayscale` · `desaturate=0.15` · `mp_policy=off`
+- **全身/半身竖图**：`letterbox` · `896` · `grayscale` · `0.15` · `off`
+- **横幅/风景/多人**：`letterbox` · `896` · `grayscale` · `0.15` · `limit`
+- **高钥/白底产品**：`letterbox` · `672` · `neutral_gray` · `0.10` · `off`
+- **需要改颜色**：按场景选 · `color_mode=original` · `desaturate<=0.05` 或 `neutralize=false`
+
+## 默认建议 / Default
+- `letterbox` · `fixed_size=896` · `color_mode=grayscale` · `desaturate=0.15` · `mp_policy=off`
+- 
 1) **QI_TextEncodeQwenImageEdit_Safe（图像编辑编码器）**  
 - **作用**：将 *提示词+输入图像+VAE* 编码为采样所需的 *conditioning / image / latent*，用于**文字/视觉混合驱动的编辑**。  
 - **要点用法**：  
