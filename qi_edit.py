@@ -266,21 +266,21 @@ class QI_TextEncodeQwenImageEdit_Safe:
             recon_bhwc = _bhwc(recon)
 
         # multi-scale refs
-        pix_base = recon_bhwc if (need_recon 和 recon_bhwc is not 无) else padded
-        pixE = _lowpass_ref(pix_base, 64) if need_pixels else 无
-        pixM = pix_base if need_pixels else 无
+        pix_base = recon_bhwc if (need_recon  and  recon_bhwc is not None) else padded
+        pixE = _lowpass_ref(pix_base, 64) if need_pixels else None
+        pixM = pix_base if need_pixels else None
         pixL = _hf_ref(pix_base, alpha=0.4, blur_k=3) if need_pixels else None
 
         # Use an internal default emphasis now that the external control is removed
         sch = self._derive_schedule(0.60, prompt, H, W)
 
         # latent anchors
-        if inject_mode 在 ("both","latents"):
+        if inject_mode in ("both","latents"):
             for _ in range(sch["lat_rep"]):
                 cond=node_helpers.conditioning_set_values(
                     cond, {"reference_latents":[lat],
                            "strength": sch["lat_w"],
-                           "timestep_percent_range": sch["lat_range"]}，
+                           "timestep_percent_range": sch["lat_range"]},
                     append=True)
 
         # pixel anchors (E/M/L)
@@ -289,7 +289,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                 cond=node_helpers.conditioning_set_values(
                     cond, {"reference_pixels":[pixE],
                            "strength": sch["pixE_w"],
-                           "timestep_percent_range": sch["pixE_range"]}，
+                           "timestep_percent_range": sch["pixE_range"]},
                     append=True)
             if pixM is not None:
                 for _ in range(sch["pix_rep"]):
