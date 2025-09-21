@@ -117,40 +117,14 @@ class QI_TextEncodeQwenImageEdit_Safe:
 
     @classmethod
     def INPUT_TYPES(cls):
-        # Default multi-character consistency oriented system template
-        default_template = """<|im_start|>system
-
-You are a Prompt optimizer specialized in multi-character consistency for image generation/editing. Your primary goal is to preserve each character’s identity without confusion when multiple figures appear together.
-
-Multi-Character Consistency Protocol (CRITICAL):
-
-INDIVIDUAL FEATURE ISOLATION: For each character, maintain separate records of facial/clothing/features to prevent cross-contamination
-CHARACTER IDENTIFICATION: Assign unique labels (e.g., “Original Character”, “New Character A”) during feature documentation
-FEATURE PRIORITIZATION: Treat each character’s facial features (structure, expression) as highest priority for isolation
-VISUAL DISTINCTION: Ensure hairstyles, clothing patterns, and accessories differ sufficiently between characters
-Character Consistency Priority (PER CHARACTER):
-
-FACIAL FEATURES: Exact structure, shape, expressions
-HAIR: Texture, style, color, accessories
-EYES: Color, shape, brows, lashes
-SKIN: Tone, texture, markings
-DISTINCTIVE FEATURES: Tattoos, piercings, etc.
-CLOTHING: Patterns, colors, styles
-
-Task Requirements:
-
-When adding multiple characters, FIRST document EACH character’s complete feature set separately
-Use explicit labels for each character during description (e.g., “Original Character maintains [features]”, “New Character A has [features]”)
-Ensure visual differences between characters are clearly defined to avoid confusion
-Prioritize individual character recognition over scene complexity
-Limit responses to 200 words focusing on isolated feature preservation
-Process: Document each character’s features individually, then describe scene integration while maintaining strict separation of all attributes. Add “Ultra HD, 4K, cinematic lighting” for clarity.
-
-<|im_end|>
-<|im_start|>user
-<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>
-<|im_start|>assistant
-"""
+        # Default system body (no tags). Clear this field to disable custom template.
+        default_template = (
+            "You are a Prompt optimizer for image generation. Evaluate the user's input: "
+            "if it requires expansion (e.g., due to vagueness, multiple characters without clear distinction, or missing details), "
+            "enhance it by adding precise feature descriptions, using unique labels per character, ensuring visual distinctions, "
+            "and including quality tags like \"Ultra HD, 4K, cinematic lighting\". "
+            "If the input is already detailed and clear, output it verbatim. Keep enhanced prompts under 300 words."
+        )
 
         return {"required":{
                     "clip":("CLIP",),
@@ -229,17 +203,29 @@ Process: Document each character’s features individually, then describe scene 
         original_tokenizer = getattr(clip, 'tokenizer', None)
         restore_needed = False
         old_template = None
-        if original_tokenizer is not None and system_template is not None and len(system_template) > 0:
+        if original_tokenizer is not None and system_template is not None and len(system_template.strip()) > 0:
             try:
                 # Many Qwen tokenizers read from `llama_template_images`
+                sys_body = system_template.strip()
                 if hasattr(original_tokenizer, 'llama_template_images'):
                     old_template = getattr(original_tokenizer, 'llama_template_images', None)
-                    setattr(original_tokenizer, 'llama_template_images', system_template)
+                    # Wrap user-provided system content with fixed Qwen image template skeleton
+                    final_template = (
+                        "<|im_start|>system\n" + sys_body +
+                        "\n<|im_end|>\n<|im_start|>user\n"
+                        "<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n"
+                        "<|im_start|>assistant\n"
+                    )
+                    setattr(original_tokenizer, 'llama_template_images', final_template)
                     restore_needed = True
                 elif hasattr(original_tokenizer, 'llama_template'):
                     # Fallback: some tokenizers only use text template key
                     old_template = getattr(original_tokenizer, 'llama_template', None)
-                    setattr(original_tokenizer, 'llama_template', system_template)
+                    final_template = (
+                        "<|im_start|>system\n" + sys_body +
+                        "\n<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+                    )
+                    setattr(original_tokenizer, 'llama_template', final_template)
                     restore_needed = True
             except Exception:
                 restore_needed = False
