@@ -117,6 +117,41 @@ class QI_TextEncodeQwenImageEdit_Safe:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Default multi-character consistency oriented system template
+        default_template = """<|im_start|>system
+
+You are a Prompt optimizer specialized in multi-character consistency for image generation/editing. Your primary goal is to preserve each character’s identity without confusion when multiple figures appear together.
+
+Multi-Character Consistency Protocol (CRITICAL):
+
+INDIVIDUAL FEATURE ISOLATION: For each character, maintain separate records of facial/clothing/features to prevent cross-contamination
+CHARACTER IDENTIFICATION: Assign unique labels (e.g., “Original Character”, “New Character A”) during feature documentation
+FEATURE PRIORITIZATION: Treat each character’s facial features (structure, expression) as highest priority for isolation
+VISUAL DISTINCTION: Ensure hairstyles, clothing patterns, and accessories differ sufficiently between characters
+Character Consistency Priority (PER CHARACTER):
+
+FACIAL FEATURES: Exact structure, shape, expressions
+HAIR: Texture, style, color, accessories
+EYES: Color, shape, brows, lashes
+SKIN: Tone, texture, markings
+DISTINCTIVE FEATURES: Tattoos, piercings, etc.
+CLOTHING: Patterns, colors, styles
+
+Task Requirements:
+
+When adding multiple characters, FIRST document EACH character’s complete feature set separately
+Use explicit labels for each character during description (e.g., “Original Character maintains [features]”, “New Character A has [features]”)
+Ensure visual differences between characters are clearly defined to avoid confusion
+Prioritize individual character recognition over scene complexity
+Limit responses to 200 words focusing on isolated feature preservation
+Process: Document each character’s features individually, then describe scene integration while maintaining strict separation of all attributes. Add “Ultra HD, 4K, cinematic lighting” for clarity.
+
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>
+<|im_start|>assistant
+"""
+
         return {"required":{
                     "clip":("CLIP",),
                     "prompt":("STRING",{"multiline":True,"default":""}),
@@ -128,8 +163,9 @@ class QI_TextEncodeQwenImageEdit_Safe:
                     "grid_multiple":("INT",{"default":64,"min":8,"max":128,"step":8}),
                     "inject_mode":(["both","latents","pixels"],{"default":"both"}),
                     "encode_fp32":("BOOLEAN",{"default":True}),
-                    "prompt_emphasis":("FLOAT",{"default":0.60,"min":0.0,"max":1.0,"step":0.05}),
-                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536})}}
+                    "vl_max_pixels":("INT",{"default":16_777_216,"min":0,"max":16_777_216,"step":65536}),
+                    "system_template":("STRING", {"multiline": True, "default": default_template}),
+                }}
 
     # --- adaptive schedule (multi-scale pixel anchoring) ---
     def _derive_schedule(self, emph: float, prompt: str, H:int, W:int) -> Dict[str, Any]:
@@ -167,8 +203,8 @@ class QI_TextEncodeQwenImageEdit_Safe:
 
     def encode(self, clip, prompt, image, vae,
                no_resize_pad=True, pad_mode="reflect", grid_multiple=64,
-               inject_mode="both", encode_fp32=True, prompt_emphasis=0.60,
-               vl_max_pixels=16_777_216):
+               inject_mode="both", encode_fp32=True,
+               vl_max_pixels=16_777_216, system_template: Optional[str]=None):
 
         src=_bhwc(image)[...,:3]
         src_mean, src_std = _rgb_stats(src)
@@ -189,7 +225,35 @@ class QI_TextEncodeQwenImageEdit_Safe:
 
         vl_img = _limit_area_keep_ar_smart(padded, int(vl_max_pixels) if vl_max_pixels is not None else 0, self._ALIGN_MULTIPLE) if self._SMART_RESAMPLE else padded
 
+        # Temporarily apply custom Qwen2.5VL system template for image prompts if supported
+        original_tokenizer = getattr(clip, 'tokenizer', None)
+        restore_needed = False
+        old_template = None
+        if original_tokenizer is not None and system_template is not None and len(system_template) > 0:
+            try:
+                # Many Qwen tokenizers read from `llama_template_images`
+                if hasattr(original_tokenizer, 'llama_template_images'):
+                    old_template = getattr(original_tokenizer, 'llama_template_images', None)
+                    setattr(original_tokenizer, 'llama_template_images', system_template)
+                    restore_needed = True
+                elif hasattr(original_tokenizer, 'llama_template'):
+                    # Fallback: some tokenizers only use text template key
+                    old_template = getattr(original_tokenizer, 'llama_template', None)
+                    setattr(original_tokenizer, 'llama_template', system_template)
+                    restore_needed = True
+            except Exception:
+                restore_needed = False
+
         tokens=clip.tokenize(prompt, images=[vl_img])
+        # Restore tokenizer template if we changed it
+        if restore_needed and original_tokenizer is not None:
+            try:
+                if hasattr(original_tokenizer, 'llama_template_images'):
+                    setattr(original_tokenizer, 'llama_template_images', old_template)
+                elif hasattr(original_tokenizer, 'llama_template'):
+                    setattr(original_tokenizer, 'llama_template', old_template)
+            except Exception:
+                pass
         cond=clip.encode_from_tokens_scheduled(tokens)
 
         # VAE encode + optional recon (AMP only when CUDA)
@@ -216,20 +280,21 @@ class QI_TextEncodeQwenImageEdit_Safe:
             recon_bhwc = _bhwc(recon)
 
         # multi-scale refs
-        pix_base = recon_bhwc if (need_recon and recon_bhwc is not None) else padded
-        pixE = _lowpass_ref(pix_base, 64) if need_pixels else None
-        pixM = pix_base if need_pixels else None
+        pix_base = recon_bhwc if (need_recon 和 recon_bhwc is not 无) else padded
+        pixE = _lowpass_ref(pix_base, 64) if need_pixels else 无
+        pixM = pix_base if need_pixels else 无
         pixL = _hf_ref(pix_base, alpha=0.4, blur_k=3) if need_pixels else None
 
-        sch = self._derive_schedule(float(prompt_emphasis), prompt, H, W)
+        # Use an internal default emphasis now that the external control is removed
+        sch = self._derive_schedule(0.60, prompt, H, W)
 
         # latent anchors
-        if inject_mode in ("both","latents"):
+        if inject_mode 在 ("both","latents"):
             for _ in range(sch["lat_rep"]):
                 cond=node_helpers.conditioning_set_values(
                     cond, {"reference_latents":[lat],
                            "strength": sch["lat_w"],
-                           "timestep_percent_range": sch["lat_range"]},
+                           "timestep_percent_range": sch["lat_range"]}，
                     append=True)
 
         # pixel anchors (E/M/L)
@@ -238,7 +303,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
                 cond=node_helpers.conditioning_set_values(
                     cond, {"reference_pixels":[pixE],
                            "strength": sch["pixE_w"],
-                           "timestep_percent_range": sch["pixE_range"]},
+                           "timestep_percent_range": sch["pixE_range"]}，
                     append=True)
             if pixM is not None:
                 for _ in range(sch["pix_rep"]):
