@@ -5,7 +5,7 @@ version = "1.0.1"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "wallen", email = "you@example.com" }]
+authors = [{ name = "wallen", email = "496727593@qq.com" }]
 dependencies = []
 
 [project.urls]
