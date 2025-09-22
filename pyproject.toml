@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-qi-qweneditsafe"
+description = "Safe & consistent QwenImage edit encoders and HQ VAE decode for ComfyUI."
+version = "1.0.0"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "wallen", email = "you@example.com" }]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/wallen0322/ComfyUI-QI-QwenEditSafe"
+Issues = "https://github.com/wallen0322/ComfyUI-QI-QwenEditSafe/issues"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-QI-QwenEditSafe"
+Icon = "https://raw.githubusercontent.com/wallen0322/ComfyUI-QI-QwenEditSafe/main/example_workflows/icon.png"
