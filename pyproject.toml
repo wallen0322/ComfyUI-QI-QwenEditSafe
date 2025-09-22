@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-qi-qweneditsafe"
 description = "Safe & consistent QwenImage edit encoders and HQ VAE decode for ComfyUI."
-version = "1.0.0"
+version = "1.0.1"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
