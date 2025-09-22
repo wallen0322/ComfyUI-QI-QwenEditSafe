@@ -4,6 +4,13 @@
 
 **Updated Nodes**
 
+- **New Node:** *Qwen 2.5 VL Wrapper* — `QI_QwenVLClipWrapper`  
+  Purpose: stabilize VL preprocessing (geometry/resize/color hints) for better color & consistency.
+- **Hook:** Official *Load CLIP (qwen_image)* → **Wrapper** → your encoder (`clip`).
+- **Recipes:** Portrait `center_crop·672·grayscale·0.15·off`; Full/vertical `letterbox·896·grayscale·0.15·off`; Landscape `letterbox·896·grayscale·0.15·limit`; High‑key `letterbox·672·neutral_gray·0.10·off`; Color‑change `color_mode=original` + low desat (≤0.05) or neutralize=false.
+- **Default:** `letterbox·896·grayscale·0.15·off`
+
+
 1) **QI_TextEncodeQwenImageEdit_Safe (Image Edit Encoder)**  
 - **Purpose**: Encode *prompt + input image + VAE* into *conditioning / image / latent* for text–vision mixed editing.  
 - **How to use**:  
