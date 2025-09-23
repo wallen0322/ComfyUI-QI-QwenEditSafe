@@ -119,15 +119,20 @@ def _chol2x2(a,b,c, eps=1e-8):
     return l11, l21, l22, inv_l11, inv_l21, inv_l22
 
 def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
-    # build robust midtone mask & exclude near-gray
+    # robust midtone mask & exclude near-gray
     B,_,H,W = Yx.shape
     yv = Yx.reshape(B,1,H*W)
     lo = torch.quantile(yv, 0.06, dim=-1, keepdim=True).reshape(B,1,1,1)
     hi = torch.quantile(yv, 0.94, dim=-1, keepdim=True).reshape(B,1,1,1)
     mask = (Yx>=lo) & (Yx<=hi)
-    # exclude very low chroma
+    # exclude very low chroma (brighter scenes stricter)
+    meanY = Yx.mean(dim=(2,3), keepdim=True)
+    base_thr = 1.6e-3
+    hi_thr = 2.0e-3
+    thr = torch.full_like(Yx, base_thr)
+    thr = torch.where(meanY > 0.72, torch.full_like(thr, hi_thr), thr)
     chroma2 = Cbx*Cbx + Crx*Crx
-    mask = mask & (chroma2 > 8e-4)
+    mask = mask & (chroma2 > thr)
 
     m = mask.float()
     denom = m.sum(dim=(2,3), keepdim=True).clamp_min(1.0)
@@ -156,19 +161,25 @@ def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
     t10 = l21r*inv11x + l22r*inv21x
     t11 = l21r*0.0    + l22r*inv22x
 
-    # clamp transform: diag within ±3%, off-diag within ±0.02
-    t00 = t00.clamp(0.97, 1.03)
-    t11 = t11.clamp(0.97, 1.03)
-    t01 = t01.clamp(-0.02, 0.02)
-    t10 = t10.clamp(-0.02, 0.02)
+    # clamp transform: tighten rotation & mean shifts for color fidelity
+    t00 = t00.clamp(0.985, 1.015)   # diag shrink range
+    t11 = t11.clamp(0.985, 1.015)
+    t01 = t01.clamp(-0.015, 0.015)  # off-diag smaller
+    t10 = t10.clamp(-0.015, 0.015)
 
-    # mean shift clamp ±0.003
-    dmu_cb = (mu_r_cb - mu_x_cb).clamp(-0.003, 0.003)
-    dmu_cr = (mu_r_cr - mu_x_cr).clamp(-0.003, 0.003)
+    # mean shift clamp (brighter scenes stricter)
+    dmu_cb = (mu_r_cb - mu_x_cb)
+    dmu_cr = (mu_r_cr - mu_x_cr)
+    base_mu = 0.002
+    strict_mu = 0.0015
+    mu_lim = torch.where(meanY > 0.72, torch.full_like(meanY, strict_mu), torch.full_like(meanY, base_mu))
+    dmu_cb = dmu_cb.clamp(-mu_lim, mu_lim)
+    dmu_cr = dmu_cr.clamp(-mu_lim, mu_lim)
 
     # brightness-adaptive conservative factor for very bright scenes
-    meanY = Yx.mean(dim=(2,3), keepdim=True)  # Bx1x1x1
-    k = 1.0 - torch.clamp(meanY - 0.7, min=0.0, max=0.1) * 0.4  # 0.8..1.0
+    delta = torch.clamp(meanY - 0.72, min=0.0, max=0.20)
+    k = 1.0 - delta * 0.55
+    k = torch.clamp(k, 0.75, 1.0)
     t00 = 1.0 + (t00 - 1.0)*k
     t11 = 1.0 + (t11 - 1.0)*k
     t01 = t01 * k
@@ -208,16 +219,16 @@ def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.97
     G2 = (Yx - 0.2126*R2 - 0.0722*B2) / 0.7152
     aligned = torch.cat([R2,G2,B2], dim=1).clamp(0,1)
 
-    # highlight/lowlight attenuation for blending
+    # highlight/lowlight attenuation for blending — slightly more conservative mid
     w_hi = 1.0 - _smoothstep(0.74, 0.93, Yx)
     w_lo = _smoothstep(0.05, 0.12, Yx)
-    w = (mix * w_hi * w_lo).clamp(0.0, 1.0)
+    w = (0.9 * mix * w_hi * w_lo).clamp(0.0, 1.0)
 
     out_lin = w*aligned + (1.0 - w)*x_lin
     out = _linear_to_srgb(out_lin).movedim(1,-1)
     return _ensure_rgb3(out)
 
-# -------------------- reference builders (unchanged) --------------------
+# -------------------- reference builders --------------------
 def _lowpass_ref(bhwc: torch.Tensor, size: int=64) -> torch.Tensor:
     bchw = _bchw(bhwc)
     bh = F.interpolate(bchw, size=(size,size), mode="area")
@@ -250,7 +261,7 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     tex = (tex - 0.2)/0.8; tex = tex.clamp(0,1)
     gate = (0.16 + 0.40*(e/(e.mean(dim=(2,3), keepdim=True)*3.0)) + 0.10*tex) * (0.85 + 0.15*mid)
     gate3 = torch.cat([gate,gate,gate], dim=1)
-    dm = torch.tanh(d*2.0)*0.38
+    dm = torch.tanh(d*2.0)*0.30  # slightly lower amplitude to avoid over-contrast
     out = (bchw + alpha*(dm*gate3)).clamp(0,1)
     return _ensure_rgb3(out.movedim(1,-1))
 
@@ -263,18 +274,26 @@ class QI_RefEditEncode_Safe:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "clip": ("CLIP",),
-            "prompt": ("STRING", {"multiline": True, "default": ""}),
-            "image": ("IMAGE",),
-            "vae": ("VAE",),
-            "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-            "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-            "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"}),
-        }}
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "vae": ("VAE",),
+                "image": ("IMAGE",),
+                "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
+                "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
+                "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"})
+            },
+            "optional": {
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+                "image5": ("IMAGE",)
+            }
+        }
 
-    def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural"):
+def encode(self, clip, prompt, vae, image, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural", image2=None, image3=None, image4=None, image5=None):
         # source/output sizes
         src = _bhwc(image)[...,:3]
         H,W = int(src.shape[1]), int(src.shape[2])
@@ -302,26 +321,47 @@ class QI_RefEditEncode_Safe:
         padded = letter.contiguous()
 
         # CLIP tokens with VL cap
+        ref_images = [image] + [im for im in (image2, image3, image4, image5) if im is not None]
+        vl_imgs = []
+        for _im in ref_images:
+            _bh = _bhwc(_im)[...,:3]
+            _vl = _cap_vl(_bh)
+            vl_imgs.append(_vl)
+        # legacy single image kept as padded for other branches
         vl_img = _cap_vl(padded)
-        tokens = clip.tokenize(prompt, images=[vl_img])
+        tokens = clip.tokenize(prompt, images=vl_imgs)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
         # VAE encode
         with torch.inference_mode():
             lat = vae.encode(padded)
             if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
+        ref_latents = [lat]
+        _REF_MAX_PIX = 1_200_000
+        for _im in (image2, image3, image4, image5):
+            if _im is None: continue
+            _bh = _bhwc(_im)[...,:3]
+            cur_area = _bh.shape[1]*_bh.shape[2]
+            if cur_area > _REF_MAX_PIX:
+                scale = (_REF_MAX_PIX/float(cur_area))**0.5
+                Hs = max(1,int(_bh.shape[1]*scale)); Ws = max(1,int(_bh.shape[2]*scale))
+                _bh = _ensure_rgb3(_resize_bchw_smart(_bchw(_bh), Ws, Hs).movedim(1,-1))
+            _l = vae.encode(_bh)
+            if isinstance(_l, dict) and 'samples' in _l: _l = _l['samples']
+            if isinstance(_l, torch.Tensor) and _l.dtype != torch.float32: _l = _l.float()
+            ref_latents.append(_l)
             if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
 
         # schedule weights (quality presets)
         emph = float(max(0.0, min(1.0, prompt_emphasis)))
         if quality_mode == "fast":
-            lat_e, pixM_e, pixE_e = 0.68, 0.42, 0.20; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.02; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.68, 0.40, 0.16; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.018; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
         elif quality_mode == "best":
-            lat_e, pixM_e, pixE_e = 0.76, 0.52, 0.26; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.03; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
+            lat_e, pixM_e, pixE_e = 0.76, 0.50, 0.20; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.020; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
         elif quality_mode == "balanced":
-            lat_e, pixM_e, pixE_e = 0.72, 0.48, 0.24; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.025; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.72, 0.46, 0.18; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
         else:
-            lat_e, pixM_e, pixE_e = 0.73, 0.49, 0.24; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.025; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.73, 0.47, 0.18; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
 
         # global scale by prompt_emphasis (keep latent always-locked)
         ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
@@ -329,12 +369,12 @@ class QI_RefEditEncode_Safe:
 
         # ---- two-step adherence: early "more prompt", late "more consistency" ----
         e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
-        l_mult = max(0.75, min(1.15, 0.75 + 0.40 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency
+        l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency (slightly milder)
 
         pixE_e *= e_mult
         pixM_e *= 0.85 * e_mult
         pixM_l *= l_mult
-        pixL_l *= 1.15 * l_mult   # only used in late hf range
+        pixL_l *= 0.95 * l_mult   # reduce micro-contrast in late HF
 
         # build references
         pixM = padded if (pixM_e>0 or pixM_l>0) else None
