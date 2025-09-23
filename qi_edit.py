@@ -129,9 +129,13 @@ class QI_TextEncodeQwenImageEdit_Safe:
         return {"required":{
                     "clip":("CLIP",),
                     "prompt":("STRING",{"multiline":True,"default":""}),
-                    "image":("IMAGE",),
-                    "vae":("VAE",)},
+                    "vae":("VAE",),
+                    "image":("IMAGE",)},
                 "optional":{
+                    "image2": ("IMAGE",),
+                    "image3": ("IMAGE",),
+                    "image4": ("IMAGE",),
+                    "image5": ("IMAGE",),
                     "no_resize_pad":("BOOLEAN",{"default":True}),
                     "pad_mode":(["reflect","replicate"],{"default":"reflect"}),
                     "grid_multiple":("INT",{"default":64,"min":8,"max":128,"step":8}),
@@ -175,10 +179,10 @@ class QI_TextEncodeQwenImageEdit_Safe:
             "pixM_range": pix_mid,   "pixM_w": float(w_pix_m), "pix_rep":int(pix_rep),
             "pixL_range": pix_late,  "pixL_w": float(w_pix_l)}
 
-    def encode(self, clip, prompt, image, vae,
+    def encode(self, clip, prompt, vae, image, 
                no_resize_pad=True, pad_mode="reflect", grid_multiple=64,
                inject_mode="both", encode_fp32=True,
-               vl_max_pixels=16_777_216, system_template: Optional[str]=None):
+               vl_max_pixels=16_777_216, system_template: Optional[str]=None, image2=None, image3=None, image4=None, image5=None):
 
         src=_bhwc(image)[...,:3]
         src_mean, src_std = _rgb_stats(src)
@@ -230,7 +234,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
             except Exception:
                 restore_needed = False
 
-        tokens=clip.tokenize(prompt, images=[vl_img])
+        tokens=clip.tokenize(prompt, images=vl_imgs)
         # Restore tokenizer template if we changed it
         if restore_needed and original_tokenizer is not None:
             try:
@@ -278,7 +282,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
         if inject_mode in ("both","latents"):
             for _ in range(sch["lat_rep"]):
                 cond=node_helpers.conditioning_set_values(
-                    cond, {"reference_latents":[lat],
+                    cond, {"reference_latents": ref_latents,
                            "strength": sch["lat_w"],
                            "timestep_percent_range": sch["lat_range"]},
                     append=True)
@@ -305,10 +309,21 @@ class QI_TextEncodeQwenImageEdit_Safe:
                            "timestep_percent_range": sch["pixL_range"]},
                     append=True)
 
-        latent={"samples":lat,
-                "qi_pad":{"top":int(top),"bottom":int(bottom),"left":int(left),"right":int(right),
-                          "orig_h":int(H),"orig_w":int(W)},
-                "qi_color":{"mean":src_mean.cpu().numpy().tolist(), "std":src_std.cpu().numpy().tolist()}}
+        latent={"samples":lat}
+        ref_latents = [lat]
+        _REF_MAX_PIX = 1_200_000
+        for _im in (image2, image3, image4, image5):
+            if _im is None: continue
+            _bh = _bhwc(_im)[...,:3]
+            cur_area = _bh.shape[1]*_bh.shape[2]
+            if cur_area > _REF_MAX_PIX:
+                scale = (_REF_MAX_PIX/float(cur_area))**0.5
+                Hs = max(1,int(_bh.shape[1]*scale)); Ws = max(1,int(_bh.shape[2]*scale))
+                _bh = _ensure_rgb3(_resize_bchw_smart(_bchw(_bh), Ws, Hs).movedim(1,-1))
+            _l = vae.encode(_bh)
+            if isinstance(_l, dict) and 'samples' in _l: _l = _l['samples']
+            if isinstance(_l, torch.Tensor) and _l.dtype != torch.float32: _l = _l.float()
+            ref_latents.append(_l)
         return (cond, src, latent)
 
 # ----------------- VAE decode (unchanged API) -----------------
