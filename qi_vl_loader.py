@@ -135,7 +135,7 @@ class QI_QwenVLClipWrapper:
     def INPUT_TYPES(cls):
         return {"required": {
             "clip": ("CLIP",),
-            "fixed_size": ("INT", {"default": 672, "min": 224, "max": 1024, "step": 224}),
+            "fixed_size": ("INT", {"default": 672, "min": 224, "max": 1024, "step": 32}),
             "geometry": (["letterbox","center_crop"], {"default": "letterbox"}),
             "color_mode": (["grayscale","neutral_gray","original"], {"default": "grayscale"}),
             "neutralize": ("BOOLEAN", {"default": True}),
