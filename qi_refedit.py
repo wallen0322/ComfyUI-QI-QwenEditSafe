@@ -80,7 +80,11 @@ def _letterbox(src_bhwc: torch.Tensor, Wt: int, Ht: int, pad_mode: str="reflect"
     left = (Wt - Wr)//2; right  = Wt-Wr-left
     bchw = _bchw(base)
     if top>0 or bottom>0 or left>0 or right>0:
-        bchw = F.pad(bchw, (left,right,top,bottom), mode=pad_mode)
+        h, w = int(bchw.shape[2]), int(bchw.shape[3])
+        mode = pad_mode
+        if h < 2 or w < 2 or left >= w or right >= w or top >= h or bottom >= h:
+            mode = "replicate"
+        bchw = F.pad(bchw, (left,right,top,bottom), mode=mode)
     return _ensure_rgb3(bchw.movedim(1,-1)), dict(top=int(top),bottom=int(bottom),left=int(left),right=int(right))
 
 def _cap_vl(img_bhwc: torch.Tensor) -> torch.Tensor:
@@ -266,137 +270,19 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     return _ensure_rgb3(out.movedim(1,-1))
 
 # -------------------- node class --------------------
+
+
+
+def _build_chatml_multiimage(user_text: str, n_images: int) -> str:
+    parts = ["<|im_start|>user"]
+    for _ in range(max(0, int(n_images))):
+        parts.append("<|vision_start|><|image_pad|><|vision_end|>")
+    if user_text and len(user_text.strip())>0:
+        parts.append(user_text.strip())
+    parts.append("<|im_end|>")
+    parts.append("<|im_start|>assistant")
+    return "\n".join(parts)
 class QI_RefEditEncode_Safe:
-    def encode(self, clip, prompt, vae, image, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural", image2=None, image3=None, image4=None, image5=None):
-            # source/output sizes
-            src = _bhwc(image)[...,:3]
-            H,W = int(src.shape[1]), int(src.shape[2])
-            Wt = int(out_width) if int(out_width)>0 else W
-            Ht = int(out_height) if int(out_height)>0 else H
-
-            # hard compute cap
-            area = Wt*Ht
-            if area > _SAFE_MAX_PIX:
-                s = (_SAFE_MAX_PIX/float(area))**0.5
-                Wt = max(8, int(Wt*s)); Ht = max(8, int(Ht*s))
-
-            Wc = _ceil_to(Wt, _ALIGN_M); Hc = _ceil_to(Ht, _ALIGN_M)
-
-            # letterbox -> pad to compute size
-            letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
-            top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
-            ph, pw = Hc - Ht, Wc - Wt
-            if ph>0 or pw>0:
-                t2 = ph//2; b2 = ph - t2; l2 = pw//2; r2 = pw - l2
-                bchw = _bchw(letter)
-                bchw = F.pad(bchw, (l2,r2,t2,b2), mode="reflect")
-                letter = _ensure_rgb3(bchw.movedim(1,-1))
-                top+=t2; bottom+=b2; left+=l2; right+=r2
-            padded = letter.contiguous()
-
-            # CLIP tokens with VL cap
-            ref_images = [image] + [im for im in (image2, image3, image4, image5) if im is not None]
-            vl_imgs = []
-            for _im in ref_images:
-                _bh = _bhwc(_im)[...,:3]
-                _vl = _cap_vl(_bh)
-                vl_imgs.append(_vl)
-            # legacy single image kept as padded for other branches
-            vl_img = _cap_vl(padded)
-            tokens = clip.tokenize(prompt, images=vl_imgs)
-            cond = clip.encode_from_tokens_scheduled(tokens)
-
-            # VAE encode
-            with torch.inference_mode():
-                lat = vae.encode(padded)
-                if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
-            ref_latents = [lat]
-            _REF_MAX_PIX = 1_200_000
-            for _im in (image2, image3, image4, image5):
-                if _im is None: continue
-                _bh = _bhwc(_im)[...,:3]
-                cur_area = _bh.shape[1]*_bh.shape[2]
-                if cur_area > _REF_MAX_PIX:
-                    scale = (_REF_MAX_PIX/float(cur_area))**0.5
-                    Hs = max(1,int(_bh.shape[1]*scale)); Ws = max(1,int(_bh.shape[2]*scale))
-                    _bh = _ensure_rgb3(_resize_bchw_smart(_bchw(_bh), Ws, Hs).movedim(1,-1))
-                _l = vae.encode(_bh)
-                if isinstance(_l, dict) and 'samples' in _l: _l = _l['samples']
-                if isinstance(_l, torch.Tensor) and _l.dtype != torch.float32: _l = _l.float()
-                ref_latents.append(_l)
-                if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
-
-            # schedule weights (quality presets)
-            emph = float(max(0.0, min(1.0, prompt_emphasis)))
-            if quality_mode == "fast":
-                lat_e, pixM_e, pixE_e = 0.68, 0.40, 0.16; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.018; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
-            elif quality_mode == "best":
-                lat_e, pixM_e, pixE_e = 0.76, 0.50, 0.20; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.020; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
-            elif quality_mode == "balanced":
-                lat_e, pixM_e, pixE_e = 0.72, 0.46, 0.18; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
-            else:
-                lat_e, pixM_e, pixE_e = 0.73, 0.47, 0.18; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
-
-            # global scale by prompt_emphasis (keep latent always-locked)
-            ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
-            pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
-
-            # ---- two-step adherence: early "more prompt", late "more consistency" ----
-            e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
-            l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency (slightly milder)
-
-            pixE_e *= e_mult
-            pixM_e *= 0.85 * e_mult
-            pixM_l *= l_mult
-            pixL_l *= 0.95 * l_mult   # reduce micro-contrast in late HF
-
-            # build references
-            pixM = padded if (pixM_e>0 or pixM_l>0) else None
-            pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
-            pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, 0.0045, smooth) if pixL_l>0 else None
-
-            # color-lock to original (reduce drift)
-            if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.97)
-            if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.97)
-            if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.97)
-
-            early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
-
-            def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_latents": [lat],
-                    "strength": float(lat_w),
-                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                }, append=True)
-                if pixE is not None and pixE_w>0:
-                    c = node_helpers.conditioning_set_values(c, {
-                        "reference_pixels": [pixE],
-                        "strength": float(pixE_w),
-                        "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                    }, append=True)
-                if pixM is not None and pixM_w>0:
-                    c = node_helpers.conditioning_set_values(c, {
-                        "reference_pixels": [pixM],
-                        "strength": float(pixM_w),
-                        "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                    }, append=True)
-                if pixL is not None and pixL_w>0:
-                    r = hfr if hfr is not None else rng
-                    c = node_helpers.conditioning_set_values(c, {
-                        "reference_pixels": [pixL],
-                        "strength": float(pixL_w),
-                        "timestep_percent_range": [float(r[0]), float(r[1])],
-                    }, append=True)
-                return c
-
-            cond = _add_ref(cond, early, lat_e, pixE_e, pixM_e, 0.0, None)
-            cond = _add_ref(cond, late,  lat_l, 0.0,    pixM_l, pixL_l, hf_rng)
-
-            latent = {"samples": lat,
-                      "qi_pad": {"top": int(top), "bottom": int(bottom), "left": int(left), "right": int(right),
-                                 "orig_h": int(Ht), "orig_w": int(Wt),
-                                 "compute_h": int(padded.shape[1]), "compute_w": int(padded.shape[2])}}
-            return (cond, _ensure_rgb3(_bhwc(image)), latent)
     CATEGORY = "QI by wallen0322"
     RETURN_TYPES = ("CONDITIONING","IMAGE","LATENT")
     RETURN_NAMES = ("conditioning","image","latent")
@@ -404,25 +290,168 @@ class QI_RefEditEncode_Safe:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip": ("CLIP",),
-                "prompt": ("STRING", {"multiline": True, "default": ""}),
-                "vae": ("VAE",),
-                "image": ("IMAGE",),
-                "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-                "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-                "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"})
-            },
-            "optional": {
-                "image2": ("IMAGE",),
-                "image3": ("IMAGE",),
-                "image4": ("IMAGE",),
-                "image5": ("IMAGE",)
-            }
-        }
+        return {"required": {
+            "clip": ("CLIP",),
+            "prompt": ("STRING", {"multiline": True, "default": ""}),
+            "image": ("IMAGE",),
+            "vae": ("VAE",),
+            "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
+            "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
+            "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"}),
+        },
+        "optional": {
+            "image2": ("IMAGE",),
+            "image3": ("IMAGE",)
+        }}
 
+    def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural", image2=None, image3=None):
+        # source/output sizes
+        src = _bhwc(image)[...,:3]
+        H,W = int(src.shape[1]), int(src.shape[2])
+        Wt = int(out_width) if int(out_width)>0 else W
+        Ht = int(out_height) if int(out_height)>0 else H
+
+        # hard compute cap
+        area = Wt*Ht
+        if area > _SAFE_MAX_PIX:
+            s = (_SAFE_MAX_PIX/float(area))**0.5
+            Wt = max(8, int(Wt*s)); Ht = max(8, int(Ht*s))
+
+        Wc = _ceil_to(Wt, _ALIGN_M); Hc = _ceil_to(Ht, _ALIGN_M)
+
+        # letterbox -> pad to compute size
+        letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
+        top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
+        ph, pw = Hc - Ht, Wc - Wt
+        if ph>0 or pw>0:
+            t2 = ph//2; b2 = ph - t2; l2 = pw//2; r2 = pw - l2
+            bchw = _bchw(letter)
+            h, w = int(bchw.shape[2]), int(bchw.shape[3])
+            _mode = "reflect"
+            if h < 2 or w < 2 or l2 >= w or r2 >= w or t2 >= h or b2 >= h:
+                _mode = "replicate"
+            bchw = F.pad(bchw, (l2,r2,t2,b2), mode=_mode)
+            letter = _ensure_rgb3(bchw.movedim(1,-1))
+            top+=t2; bottom+=b2; left+=l2; right+=r2
+        padded = letter.contiguous()
+
+        # CLIP tokens with VL cap
+        
+        # ---- Official-like front half (Qwen TextEncodeQwenImageEditPlus) ----
+        images_vl = []
+        ref_latents = []
+        images_in = [image, image2, image3]
+        image_prompt = ""
+        for i, im in enumerate(images_in):
+            if im is None:
+                continue
+            im_bhwc = _bhwc(im)[...,:3]
+            samples = im_bhwc.movedim(-1, 1)
+            total = int(384 * 384)
+            Hs, Ws = samples.shape[2], samples.shape[3]
+            scale_by = (total / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
+            width  = max(1, int(round(Ws * scale_by)))
+            height = max(1, int(round(Hs * scale_by)))
+            s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
+            images_vl.append(s.movedim(1, -1))
+            if vae is not None:
+                total_l = int(1024 * 1024)
+                scale_by_l = (total_l / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
+                width_l  = max(8, int(round(Ws * scale_by_l / 8.0)) * 8)
+                height_l = max(8, int(round(Hs * scale_by_l / 8.0)) * 8)
+                s_l = comfy.utils.common_upscale(samples, width_l, height_l, "area", "disabled")
+                ref_latents.append(vae.encode(s_l.movedim(1,-1)[:, :, :, :3]))
+            image_prompt += f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>"
+        chat = "<|im_start|>user\n" + image_prompt + (prompt if isinstance(prompt,str) else str(prompt)) + "\n<|im_end|>\n<|im_start|>assistant\n"
+        tokens = clip.tokenize(chat, images=images_vl)
+        cond = clip.encode_from_tokens_scheduled(tokens)
+        if len(ref_latents) > 0:
+            cond = node_helpers.conditioning_set_values(cond, {"reference_latents": ref_latents}, append=True)
+        # ---- End official-like front half ----
+
+
+        # VAE encode
+        with torch.inference_mode():
+            lat = vae.encode(padded)
+            if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
+            if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
+
+        # schedule weights (quality presets)
+        emph = float(max(0.0, min(1.0, prompt_emphasis)))
+        if quality_mode == "fast":
+            lat_e, pixM_e, pixE_e = 0.68, 0.40, 0.16; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.018; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
+        elif quality_mode == "best":
+            lat_e, pixM_e, pixE_e = 0.76, 0.50, 0.20; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.020; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
+        elif quality_mode == "balanced":
+            lat_e, pixM_e, pixE_e = 0.72, 0.46, 0.18; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+        else:
+            lat_e, pixM_e, pixE_e = 0.73, 0.47, 0.18; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+
+        # global scale by prompt_emphasis (keep latent always-locked)
+        ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
+        pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
+
+        # ---- two-step adherence: early "more prompt", late "more consistency" ----
+        e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
+        l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency (slightly milder)
+
+        pixE_e *= e_mult
+        pixM_e *= 0.85 * e_mult
+        pixM_l *= l_mult
+        pixL_l *= 0.95 * l_mult   # reduce micro-contrast in late HF
+
+        # build references
+        pixM = padded if (pixM_e>0 or pixM_l>0) else None
+        pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
+        pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, 0.0045, smooth) if pixL_l>0 else None
+
+        # color-lock to original (reduce drift)
+        if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.97)
+        if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.97)
+        if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.97)
+
+        early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
+
+        def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
+            c = node_helpers.conditioning_set_values(c, {
+                "reference_latents": [lat],
+                "strength": float(lat_w),
+                "timestep_percent_range": [float(rng[0]), float(rng[1])],
+            }, append=True)
+            if pixE is not None and pixE_w>0:
+                c = node_helpers.conditioning_set_values(c, {
+                    "reference_pixels": [pixE],
+                    "strength": float(pixE_w),
+                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
+                }, append=True)
+            if pixM is not None and pixM_w>0:
+                c = node_helpers.conditioning_set_values(c, {
+                    "reference_pixels": [pixM],
+                    "strength": float(pixM_w),
+                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
+                }, append=True)
+            if pixL is not None and pixL_w>0:
+                r = hfr if hfr is not None else rng
+                c = node_helpers.conditioning_set_values(c, {
+                    "reference_pixels": [pixL],
+                    "strength": float(pixL_w),
+                    "timestep_percent_range": [float(r[0]), float(r[1])],
+                }, append=True)
+            return c
+
+        # Step A (edit): disable early anchors to preserve prompt control and official behavior
+        # cond = _add_ref(cond, early, lat_e, pixE_e, pixM_e, 0.0, None)
+        lat_l_enh  = float(lat_l * 1.10)
+        pixM_l_enh = float(pixM_l * 0.85)
+        pixL_l_enh = float(pixL_l * 1.12)
+        cond = _add_ref(cond, late,  lat_l_enh, 0.0,    pixM_l_enh, pixL_l_enh, hf_rng)
+
+        latent = {"samples": lat,
+                  "qi_pad": {"top": int(top), "bottom": int(bottom), "left": int(left), "right": int(right),
+                             "orig_h": int(Ht), "orig_w": int(Wt),
+                             "compute_h": int(padded.shape[1]), "compute_w": int(padded.shape[2])}}
+        return (cond, _ensure_rgb3(_bhwc(image)), latent)
 
 NODE_CLASS_MAPPINGS = {"QI_RefEditEncode_Safe": QI_RefEditEncode_Safe}
 NODE_DISPLAY_NAME_MAPPINGS = {"QI_RefEditEncode_Safe": "Qwen一致性编辑编码器 — by wallen0322"}
