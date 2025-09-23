@@ -1,4 +1,46 @@
 from __future__ import annotations
+# --- injected: official multi-image front-half ---
+def _qwen_build_front_half(images_in, prompt, clip, vae):
+    """
+    Official-like multi-image front-half for Qwen Edit:
+      - Per image: ~384x384 area with AREA (VL), build "Picture n:" placeholders
+      - If VAE provided: per image ~1024x1024 area (/8 aligned) latent, append to conditioning
+    """
+    import comfy
+    from nodes import node_helpers
+    images_vl = []
+    ref_latents = []
+    image_prompt = ""
+    for i, im in enumerate(images_in):
+        if im is None:
+            continue
+        im_bhwc = _bhwc(im)[...,:3]
+        samples = im_bhwc.movedim(-1, 1)  # BCHW
+        total = int(384 * 384)
+        Hs, Ws = samples.shape[2], samples.shape[3]
+        if Hs <= 0 or Ws <= 0:
+            continue
+        scale_by = (total / float(Ws*Hs)) ** 0.5
+        width  = max(1, int(round(Ws * scale_by)))
+        height = max(1, int(round(Hs * scale_by)))
+        s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
+        images_vl.append(s.movedim(1, -1))  # BHWC
+        if vae is not None:
+            total_l = int(1024 * 1024)
+            scale_by_l = (total_l / float(Ws*Hs)) ** 0.5
+            width_l  = max(8, int(round(Ws * scale_by_l / 8.0)) * 8)
+            height_l = max(8, int(round(Hs * scale_by_l / 8.0)) * 8)
+            s_l = comfy.utils.common_upscale(samples, width_l, height_l, "area", "disabled")
+            ref_latents.append(vae.encode(s_l.movedim(1,-1)[:, :, :, :3]))
+        image_prompt += f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>"
+    chat = "<|im_start|>user\n" + image_prompt + (prompt if isinstance(prompt,str) else str(prompt)) + "\n<|im_end|>\n<|im_start|>assistant\n"
+    tokens = clip.tokenize(chat, images=images_vl)
+    cond = clip.encode_from_tokens_scheduled(tokens)
+    if len(ref_latents) > 0:
+        cond = node_helpers.conditioning_set_values(cond, {"reference_latents": ref_latents}, append=True)
+    return cond
+# --- end injected ---
+
 from typing import Optional, Tuple, Dict, Any
 import torch, torch.nn.functional as F
 import node_helpers, comfy.utils
@@ -129,13 +171,9 @@ class QI_TextEncodeQwenImageEdit_Safe:
         return {"required":{
                     "clip":("CLIP",),
                     "prompt":("STRING",{"multiline":True,"default":""}),
-                    "vae":("VAE",),
-                    "image":("IMAGE",)},
+                    "image":("IMAGE",),
+                    "vae":("VAE",)},
                 "optional":{
-                    "image2": ("IMAGE",),
-                    "image3": ("IMAGE",),
-                    "image4": ("IMAGE",),
-                    "image5": ("IMAGE",),
                     "no_resize_pad":("BOOLEAN",{"default":True}),
                     "pad_mode":(["reflect","replicate"],{"default":"reflect"}),
                     "grid_multiple":("INT",{"default":64,"min":8,"max":128,"step":8}),
@@ -179,10 +217,10 @@ class QI_TextEncodeQwenImageEdit_Safe:
             "pixM_range": pix_mid,   "pixM_w": float(w_pix_m), "pix_rep":int(pix_rep),
             "pixL_range": pix_late,  "pixL_w": float(w_pix_l)}
 
-    def encode(self, clip, prompt, vae, image, 
+    def encode(self, clip, prompt, image, vae,
                no_resize_pad=True, pad_mode="reflect", grid_multiple=64,
                inject_mode="both", encode_fp32=True,
-               vl_max_pixels=16_777_216, system_template: Optional[str]=None, image2=None, image3=None, image4=None, image5=None):
+               vl_max_pixels=16_777_216, system_template: Optional[str]=None, image2=None, image3=None):
 
         src=_bhwc(image)[...,:3]
         src_mean, src_std = _rgb_stats(src)
@@ -234,17 +272,10 @@ class QI_TextEncodeQwenImageEdit_Safe:
             except Exception:
                 restore_needed = False
 
-        tokens=clip.tokenize(prompt, images=vl_imgs)
-        # Restore tokenizer template if we changed it
-        if restore_needed and original_tokenizer is not None:
-            try:
-                if hasattr(original_tokenizer, 'llama_template_images'):
-                    setattr(original_tokenizer, 'llama_template_images', old_template)
-                elif hasattr(original_tokenizer, 'llama_template'):
-                    setattr(original_tokenizer, 'llama_template', old_template)
-            except Exception:
-                pass
-        cond=clip.encode_from_tokens_scheduled(tokens)
+        # === Official front-half (3-image) ===
+        images_in = [image, image2, image3]
+        cond = _qwen_build_front_half(images_in, prompt, clip, vae)
+
 
         # VAE encode + optional recon (AMP only when CUDA)
         lat=vae.encode(padded)
@@ -282,7 +313,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
         if inject_mode in ("both","latents"):
             for _ in range(sch["lat_rep"]):
                 cond=node_helpers.conditioning_set_values(
-                    cond, {"reference_latents": ref_latents,
+                    cond, {"reference_latents":[lat],
                            "strength": sch["lat_w"],
                            "timestep_percent_range": sch["lat_range"]},
                     append=True)
@@ -309,21 +340,10 @@ class QI_TextEncodeQwenImageEdit_Safe:
                            "timestep_percent_range": sch["pixL_range"]},
                     append=True)
 
-        latent={"samples":lat}
-        ref_latents = [lat]
-        _REF_MAX_PIX = 1_200_000
-        for _im in (image2, image3, image4, image5):
-            if _im is None: continue
-            _bh = _bhwc(_im)[...,:3]
-            cur_area = _bh.shape[1]*_bh.shape[2]
-            if cur_area > _REF_MAX_PIX:
-                scale = (_REF_MAX_PIX/float(cur_area))**0.5
-                Hs = max(1,int(_bh.shape[1]*scale)); Ws = max(1,int(_bh.shape[2]*scale))
-                _bh = _ensure_rgb3(_resize_bchw_smart(_bchw(_bh), Ws, Hs).movedim(1,-1))
-            _l = vae.encode(_bh)
-            if isinstance(_l, dict) and 'samples' in _l: _l = _l['samples']
-            if isinstance(_l, torch.Tensor) and _l.dtype != torch.float32: _l = _l.float()
-            ref_latents.append(_l)
+        latent={"samples":lat,
+                "qi_pad":{"top":int(top),"bottom":int(bottom),"left":int(left),"right":int(right),
+                          "orig_h":int(H),"orig_w":int(W)},
+                "qi_color":{"mean":src_mean.cpu().numpy().tolist(), "std":src_std.cpu().numpy().tolist()}}
         return (cond, src, latent)
 
 # ----------------- VAE decode (unchanged API) -----------------
