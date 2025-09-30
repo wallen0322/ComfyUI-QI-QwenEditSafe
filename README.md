@@ -64,4 +64,4 @@ If you want to use it in your own workflow, just replace **TextEncodeQwenImageEd
 Note: Add the sentence “保持人物一致性不变，保持画风光影不变” to your prompt for better results.
 
 ## Special Thanks
-- Thanks to 封号 (https://civitai.com/user/Futurlunatic) and PT（娃导 https://github.com/ptmaster ） for rigorous testing; thanks to PT（娃导） for the idea; thanks to 粘土火星（SaturMars：https://github.com/SaturMars ） for technical support; and thanks to the Aiwood 研究院 teammates for their support.
+- Thanks to 封号 (https://civitai.com/user/Futurlunatic) and PT（娃导 https://github.com/ptmaster ） for rigorous testing; thanks to PT（娃导） for the idea; thanks to 粘土火星（SaturMars：https://github.com/SaturMars ） for technical support; thanks to Dontdrunk （https://github.com/Dontdrunk ）   ，and thanks to the Aiwood 研究院 teammates for their support.
