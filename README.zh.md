@@ -76,4 +76,4 @@
 注意：提示词中需要增加保持人物一致性不变，保持画风光影不变，这句话，效果更佳，
 
 ## 特别感谢
-- 感谢封号（https://civitai.com/user/Futurlunatic ） ，PT（娃导https://github.com/ptmaster ） 两位大佬的辛苦测试，感谢PT（娃导）的思路，感谢粘土火星（SaturMars：https://github.com/SaturMars ）  提供技术支持，感谢Dontdrunk （https://github.com/Dontdrunk） 的贡献  ，感谢Aiwood研究院小伙伴们的支持。
+- 感谢封号（https://civitai.com/user/Futurlunatic ） ，PT（娃导https://github.com/ptmaster ） 两位大佬的辛苦测试，感谢PT（娃导）的思路，感谢粘土火星（SaturMars：https://github.com/SaturMars ）  提供技术支持，感谢Dontdrunk （https://github.com/Dontdrunk ） 的贡献  ，感谢Aiwood研究院小伙伴们的支持。
