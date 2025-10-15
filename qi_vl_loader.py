@@ -35,14 +35,14 @@ def _bhwc_from_bchw(x): return x.movedim(1,-1).contiguous()
 
 def _center_crop_to_square(bchw):
     _,_,H,W = bchw.shape
-    if H==W: return bchw
+    if H==W: return bchw.contiguous()
     if H > W:
-        top = (H-W)//2; return bchw[:,:,top:top+W,:]
+        top = (H-W)//2; return bchw[:,:,top:top+W,:].contiguous()
     else:
-        left = (W-H)//2; return bchw[:,:,:,left:left+H]
+        left = (W-H)//2; return bchw[:,:,:,left:left+H].contiguous()
 
 def _resize(bchw, w, h):
-    return comfy.utils.common_upscale(bchw, w, h, "bicubic", "disabled")
+    return comfy.utils.common_upscale(bchw, w, h, "bicubic", "disabled").contiguous()
 
 def _desaturate(bchw, amt=0.12):
     if amt <= 1e-6: return bchw
@@ -103,15 +103,15 @@ class _CLIPProxyQwenVL:
             pad_t = (self.fixed_size - Hr)//2
             pad_b = self.fixed_size - Hr - pad_t
             bchw2 = torch.nn.functional.pad(base, (pad_l,pad_r,pad_t,pad_b),
-                                            mode="constant", value=0.5)  # neutral 50% gray
+                                            mode="constant", value=0.5).contiguous()  # neutral 50% gray
 
         # color handling for VL
         if self.color_mode == "grayscale":
             y = bchw2[:,0:1]*0.299 + bchw2[:,1:2]*0.587 + bchw2[:,2:3]*0.114
-            bchw2 = torch.cat([y,y,y], dim=1)
+            bchw2 = torch.cat([y,y,y], dim=1).contiguous()
         elif self.color_mode == "neutral_gray":
             mu = bchw2.mean(dim=(2,3), keepdim=True)
-            bchw2 = (bchw2 - mu) * 0.0 + mu
+            bchw2 = ((bchw2 - mu) * 0.0 + mu).contiguous()
 
         if self.neutralize and self.desat > 0 and self.color_mode == "original":
             bchw2 = _desaturate(bchw2, self.desat)
@@ -121,7 +121,7 @@ class _CLIPProxyQwenVL:
     def tokenize(self, prompt, images=None, **kwargs):
         imgs = images
         if images is not None and len(images)>0:
-            proc = [self._prep_single(im) for im in images]
+            proc = [self._prep_single(im).contiguous().float() for im in images]
             imgs = proc
         return self.base.tokenize(prompt, images=imgs, **kwargs)
 
