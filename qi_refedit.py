@@ -4,16 +4,15 @@ import torch.nn.functional as F
 import node_helpers, comfy.utils
 
 # -------------------- constants --------------------
-_ALIGN_M = 32                 # internal compute multiple
-_SAFE_MAX_PIX = 3_000_000     # hard cap for compute (3MP)
-_VL_MAX_PIX = 1_400_000       # visual input cap for CLIP vision (1.4MP)
+_ALIGN_M = 32
+_SAFE_MAX_PIX = 3_000_000
+_VL_MAX_PIX = 1_400_000
 
 # -------------------- basic image helpers --------------------
 def _ceil_to(v: int, m: int) -> int:
     return ((v + m - 1) // m) * m if m > 1 else v
 
 def _to_bhwc_any(x):
-    # accept Tensor or (list/tuple/dict)->first tensor
     if isinstance(x, (list, tuple)):
         x = x[0]
     if isinstance(x, dict):
@@ -23,14 +22,14 @@ def _to_bhwc_any(x):
     t = x
     if not isinstance(t, torch.Tensor):
         raise RuntimeError("Unsupported image container")
-    if t.ndim == 2:      # H,W -> B,H,W,C=1
+    if t.ndim == 2:
         t = t.unsqueeze(0).unsqueeze(-1)
-    elif t.ndim == 3:    # CHW or HWC -> BHWC
+    elif t.ndim == 3:
         if t.shape[0] in (1,3,4):
             t = t.unsqueeze(0).movedim(1, -1)
         else:
             t = t.unsqueeze(0)
-    elif t.ndim == 4:    # BCHW or BHWC -> BHWC
+    elif t.ndim == 4:
         if t.shape[-1] in (1,3,4):
             pass
         elif t.shape[1] in (1,3,4):
@@ -40,7 +39,7 @@ def _to_bhwc_any(x):
     else:
         raise RuntimeError(f"Unsupported tensor shape for image: {tuple(t.shape)}")
     t = t.float()
-    if t.min().item() < 0.0:   # [-1,1] -> [0,1]
+    if t.min().item() < 0.0:
         t = (t + 1.0) * 0.5
     if t.shape[-1] == 1:
         t = t.repeat(1,1,1,3)
@@ -51,10 +50,10 @@ def _ensure_rgb3(bhwc: torch.Tensor) -> torch.Tensor:
     if bhwc.shape[-1] == 1: return bhwc.repeat(1,1,1,3)
     return bhwc[...,:3]
 
-def _bhwc(x):  # IMAGE -> BHWC
+def _bhwc(x):
     return _ensure_rgb3(_to_bhwc_any(x))
 
-def _bchw(x):  # IMAGE -> BCHW
+def _bchw(x):
     return _bhwc(x).movedim(-1, 1).contiguous()
 
 def _choose_method(sw, sh, tw, th):
@@ -109,27 +108,23 @@ def _linear_to_srgb(t: torch.Tensor) -> torch.Tensor:
     t = t.clamp(0.0, 1.0)
     return torch.where(t <= 0.0031308, t*12.92, 1.055*torch.pow(t, 1.0/2.4) - 0.055)
 
-# 2x2 Cholesky for SPD [[a,b],[b,c]]
 def _chol2x2(a,b,c, eps=1e-8):
     a = torch.clamp(a, min=eps)
     l11 = torch.sqrt(a)
     l21 = b / l11
     t = torch.clamp(c - l21*l21, min=eps)
     l22 = torch.sqrt(t)
-    # L = [[l11,0],[l21,l22]], invL:
     inv_l11 = 1.0/l11
     inv_l22 = 1.0/l22
     inv_l21 = -l21 * inv_l11 * inv_l22
     return l11, l21, l22, inv_l11, inv_l21, inv_l22
 
 def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
-    # robust midtone mask & exclude near-gray
     B,_,H,W = Yx.shape
     yv = Yx.reshape(B,1,H*W)
     lo = torch.quantile(yv, 0.06, dim=-1, keepdim=True).reshape(B,1,1,1)
     hi = torch.quantile(yv, 0.94, dim=-1, keepdim=True).reshape(B,1,1,1)
     mask = (Yx>=lo) & (Yx<=hi)
-    # exclude very low chroma (brighter scenes stricter)
     meanY = Yx.mean(dim=(2,3), keepdim=True)
     base_thr = 1.6e-3
     hi_thr = 2.0e-3
@@ -154,24 +149,19 @@ def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
     mu_x_cb, mu_x_cr, ax, bx, cx = _stats(Cbx, Crx)
     mu_r_cb, mu_r_cr, ar, br, cr = _stats(Cbr, Crr)
 
-    # Cholesky whiten->color: T = Lr @ inv(Lx)
     l11x, l21x, l22x, inv11x, inv21x, inv22x = _chol2x2(ax, bx, cx)
     l11r, l21r, l22r, _, _, _ = _chol2x2(ar, br, cr)
 
-    # inv(Lx) = [[inv11x, 0],[inv21x, inv22x]]
-    # Lr = [[l11r,0],[l21r,l22r]]
     t00 = l11r*inv11x + 0.0*inv21x
     t01 = l11r*0.0    + 0.0*inv22x
     t10 = l21r*inv11x + l22r*inv21x
     t11 = l21r*0.0    + l22r*inv22x
 
-    # clamp transform: tighten rotation & mean shifts for color fidelity
-    t00 = t00.clamp(0.985, 1.015)   # diag shrink range
+    t00 = t00.clamp(0.985, 1.015)
     t11 = t11.clamp(0.985, 1.015)
-    t01 = t01.clamp(-0.015, 0.015)  # off-diag smaller
+    t01 = t01.clamp(-0.015, 0.015)
     t10 = t10.clamp(-0.015, 0.015)
 
-    # mean shift clamp (brighter scenes stricter)
     dmu_cb = (mu_r_cb - mu_x_cb)
     dmu_cr = (mu_r_cr - mu_x_cr)
     base_mu = 0.002
@@ -180,7 +170,6 @@ def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
     dmu_cb = dmu_cb.clamp(-mu_lim, mu_lim)
     dmu_cr = dmu_cr.clamp(-mu_lim, mu_lim)
 
-    # brightness-adaptive conservative factor for very bright scenes
     delta = torch.clamp(meanY - 0.72, min=0.0, max=0.20)
     k = 1.0 - delta * 0.55
     k = torch.clamp(k, 0.75, 1.0)
@@ -194,36 +183,30 @@ def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
     return (t00,t01,t10,t11), (dmu_cb,dmu_cr), (mu_x_cb,mu_x_cr)
 
 def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.97) -> torch.Tensor:
-    # sRGB -> linear
     x = _bchw(x_bhwc); r = _bchw(ref_bhwc)
     x_lin = _srgb_to_linear(x); r_lin = _srgb_to_linear(r)
 
     R,G,B   = x_lin[:,0:1], x_lin[:,1:2], x_lin[:,2:3]
     Rr,Gr,Br= r_lin[:,0:1], r_lin[:,1:2], r_lin[:,2:3]
 
-    # BT.709 YCbCr (linear)
     Yx = 0.2126*R + 0.7152*G + 0.0722*B
     Yr = 0.2126*Rr + 0.7152*Gr + 0.0722*Br
     cb_s = 0.5/(1.0-0.0722); cr_s = 0.5/(1.0-0.2126)
     Cbx = (B - Yx)*cb_s; Crx = (R - Yx)*cr_s
     Cbr = (Br - Yr)*cb_s; Crr = (Rr - Yr)*cr_s
 
-    # 2x2 stats & transform
     (t00,t01,t10,t11), (dmu_cb,dmu_cr), (mu_x_cb,mu_x_cr) = _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx)
 
-    # apply per-pixel: v' = T (v - mu_x) + (mu_x + dmu)
     cb = Cbx - mu_x_cb; cr = Crx - mu_x_cr
     Cb_aligned = t00*cb + t01*cr + (mu_x_cb + dmu_cb)
     Cr_aligned = t10*cb + t11*cr + (mu_x_cr + dmu_cr)
 
-    # reconstruct RGB (preserve Y)
     inv_cb = 1.0/cb_s; inv_cr = 1.0/cr_s
     R2 = Yx + Cr_aligned*inv_cr
     B2 = Yx + Cb_aligned*inv_cb
     G2 = (Yx - 0.2126*R2 - 0.0722*B2) / 0.7152
     aligned = torch.cat([R2,G2,B2], dim=1).clamp(0,1)
 
-    # highlight/lowlight attenuation for blending — slightly more conservative mid
     w_hi = 1.0 - _smoothstep(0.74, 0.93, Yx)
     w_lo = _smoothstep(0.05, 0.12, Yx)
     w = (0.9 * mix * w_hi * w_lo).clamp(0.0, 1.0)
@@ -255,7 +238,6 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     absd = torch.abs(detail)
     t3 = torch.cat([t,t,t], dim=1)
     d = torch.sign(detail) * torch.clamp(absd - t3, min=0.0)
-    # texture/edge gates
     sobel_x = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=y.dtype, device=y.device).view(1,1,3,3)/8.0
     sobel_y = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=y.dtype, device=y.device).view(1,1,3,3)/8.0
     e = torch.sqrt(F.conv2d(F.pad(y,(1,1,1,1),mode="replicate"), sobel_x)**2 +
@@ -265,12 +247,11 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     tex = (tex - 0.2)/0.8; tex = tex.clamp(0,1)
     gate = (0.16 + 0.40*(e/(e.mean(dim=(2,3), keepdim=True)*3.0)) + 0.10*tex) * (0.85 + 0.15*mid)
     gate3 = torch.cat([gate,gate,gate], dim=1)
-    dm = torch.tanh(d*2.0)*0.30  # slightly lower amplitude to avoid over-contrast
+    dm = torch.tanh(d*2.0)*0.30
     out = (bchw + alpha*(dm*gate3)).clamp(0,1)
     return _ensure_rgb3(out.movedim(1,-1))
 
 # -------------------- node class --------------------
-
 def _build_chatml_multiimage(user_text: str, n_images: int) -> str:
     parts = ["<|im_start|>user"]
     for _ in range(max(0, int(n_images))):
@@ -280,6 +261,7 @@ def _build_chatml_multiimage(user_text: str, n_images: int) -> str:
     parts.append("<|im_end|>")
     parts.append("<|im_start|>assistant")
     return "\n".join(parts)
+
 class QI_RefEditEncode_Safe:
     CATEGORY = "QI by wallen0322"
     RETURN_TYPES = ("CONDITIONING","IMAGE","LATENT")
@@ -304,13 +286,11 @@ class QI_RefEditEncode_Safe:
         }}
 
     def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural", image2=None, image3=None):
-        # source/output sizes
         src = _bhwc(image)[...,:3]
         H,W = int(src.shape[1]), int(src.shape[2])
         Wt = int(out_width) if int(out_width)>0 else W
         Ht = int(out_height) if int(out_height)>0 else H
 
-        # hard compute cap
         area = Wt*Ht
         if area > _SAFE_MAX_PIX:
             s = (_SAFE_MAX_PIX/float(area))**0.5
@@ -318,7 +298,6 @@ class QI_RefEditEncode_Safe:
 
         Wc = _ceil_to(Wt, _ALIGN_M); Hc = _ceil_to(Ht, _ALIGN_M)
 
-        # letterbox -> pad to compute size
         letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
         top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
         ph, pw = Hc - Ht, Wc - Wt
@@ -334,9 +313,6 @@ class QI_RefEditEncode_Safe:
             top+=t2; bottom+=b2; left+=l2; right+=r2
         padded = letter.contiguous()
 
-        # CLIP tokens with VL cap
-
-        # ---- Official-like front half (Qwen TextEncodeQwenImageEditPlus) ----
         images_vl = []
         ref_latents = []
         images_in = [image, image2, image3]
@@ -366,49 +342,50 @@ class QI_RefEditEncode_Safe:
         cond = clip.encode_from_tokens_scheduled(tokens)
         if len(ref_latents) > 0:
             cond = node_helpers.conditioning_set_values(cond, {"reference_latents": ref_latents}, append=True)
-        # ---- End official-like front half ----
 
-        # VAE encode
         with torch.inference_mode():
             lat = vae.encode(padded)
             if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
             if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
 
-        # schedule weights (quality presets)
         emph = float(max(0.0, min(1.0, prompt_emphasis)))
         if quality_mode == "fast":
-            lat_e, pixM_e, pixE_e = 0.68, 0.40, 0.16; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.018; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.65, 0.38, 0.15
+            lat_l, pixM_l, pixL_l = 0.92, 0.75, 0.016
+            hf_alpha, kstd, bias = 0.13, 0.80, 0.0048
         elif quality_mode == "best":
-            lat_e, pixM_e, pixE_e = 0.76, 0.50, 0.20; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.020; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
+            lat_e, pixM_e, pixE_e = 0.72, 0.48, 0.19
+            lat_l, pixM_l, pixL_l = 1.08, 0.92, 0.022
+            hf_alpha, kstd, bias = 0.16, 0.88, 0.0045
         elif quality_mode == "balanced":
-            lat_e, pixM_e, pixE_e = 0.72, 0.46, 0.18; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.68, 0.44, 0.17
+            lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.019
+            hf_alpha, kstd, bias = 0.15, 0.85, 0.0046
         else:
-            lat_e, pixM_e, pixE_e = 0.73, 0.47, 0.18; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.020; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+            lat_e, pixM_e, pixE_e = 0.70, 0.45, 0.17
+            lat_l, pixM_l, pixL_l = 1.05, 0.88, 0.020
+            hf_alpha, kstd, bias = 0.14, 0.82, 0.005
 
-        # global scale by prompt_emphasis (keep latent always-locked)
-        ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
+        ref_scale = max(0.75, min(1.03, 1.03 - 0.28*emph))
         pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
 
-        # ---- two-step adherence: early "more prompt", late "more consistency" ----
-        e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
-        l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency (slightly milder)
+        e_mult = max(0.75, min(1.05, 1.0 - 0.35 * emph))
+        l_mult = max(0.85, min(1.08, 0.88 + 0.20 * (1.0 - emph)))
 
         pixE_e *= e_mult
         pixM_e *= 0.85 * e_mult
         pixM_l *= l_mult
-        pixL_l *= 0.95 * l_mult   # reduce micro-contrast in late HF
+        pixL_l *= 0.95 * l_mult
 
-        # build references
         pixM = padded if (pixM_e>0 or pixM_l>0) else None
         pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
-        pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, 0.0045, smooth) if pixL_l>0 else None
+        pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, bias, 5) if pixL_l>0 else None
 
-        # color-lock to original (reduce drift)
-        if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.97)
-        if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.97)
-        if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.97)
+        if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.985)
+        if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.99)
+        if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.975)
 
-        early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
+        early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 1.0); hf_rng = (0.985, 1.0)
 
         def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
             c = node_helpers.conditioning_set_values(c, {
@@ -437,12 +414,9 @@ class QI_RefEditEncode_Safe:
                 }, append=True)
             return c
 
-        # Step A (edit): disable early anchors to preserve prompt control and official behavior
-        # cond = _add_ref(cond, early, lat_e, pixE_e, pixM_e, 0.0, None)
-        lat_l_enh  = float(lat_l * 1.10)
-        pixM_l_enh = float(pixM_l * 0.85)
-        pixL_l_enh = float(pixL_l * 1.12)
-        cond = _add_ref(cond, late,  lat_l_enh, 0.0,    pixM_l_enh, pixL_l_enh, hf_rng)
+        cond = _add_ref(cond, early, lat_e*0.70, pixE_e*0.85, pixM_e*0.65, 0.0, None)
+        cond = _add_ref(cond, mid, lat_l*0.95, 0.0, pixM_l*0.90, pixL_l*0.80, None)
+        cond = _add_ref(cond, late, lat_l*1.15, 0.0, pixM_l*1.00, pixL_l*1.20, hf_rng)
 
         latent = {"samples": lat,
                   "qi_pad": {"top": int(top), "bottom": int(bottom), "left": int(left), "right": int(right),
@@ -451,4 +425,4 @@ class QI_RefEditEncode_Safe:
         return (cond, _ensure_rgb3(_bhwc(image)), latent)
 
 NODE_CLASS_MAPPINGS = {"QI_RefEditEncode_Safe": QI_RefEditEncode_Safe}
-NODE_DISPLAY_NAME_MAPPINGS = {"QI_RefEditEncode_Safe": "Qwen一致性编辑编码器 — by wallen0322"}
+NODE_DISPLAY_NAME_MAPPINGS = {"QI_RefEditEncode_Safe": "Qwen一致性编辑编码器 – by wallen0322"}
