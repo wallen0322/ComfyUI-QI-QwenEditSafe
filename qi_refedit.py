@@ -74,7 +74,6 @@ def _resize_bchw_smart(x: torch.Tensor, w: int, h: int):
     return _resize_bchw(x, w, h, _choose_method(W,H,w,h))
 
 def _align_dimensions(W: int, H: int, max_pix: int = _SAFE_MAX_PIX):
-    """Align dimensions to optimal multiples to prevent pixel shift"""
     area = W * H
     if area > max_pix:
         s = (max_pix / float(area)) ** 0.5
@@ -269,6 +268,37 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     out = (bchw + alpha*(dm*gate3)).clamp(0,1)
     return _ensure_rgb3(out.movedim(1,-1))
 
+def _gradual_downsample(bchw: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+    current_h, current_w = bchw.shape[2], bchw.shape[3]
+    
+    kernel_size = 3
+    sigma = 0.5
+    kernel = torch.zeros((3, 1, kernel_size, kernel_size), device=bchw.device, dtype=bchw.dtype)
+    center = kernel_size // 2
+    total = 0.0
+    for i in range(kernel_size):
+        for j in range(kernel_size):
+            val = torch.exp(torch.tensor(-((i - center) ** 2 + (j - center) ** 2) / (2 * sigma ** 2)))
+            kernel[:, :, i, j] = val
+            total += val
+    kernel = kernel / total
+    
+    bchw_blur = F.conv2d(F.pad(bchw, (1, 1, 1, 1), mode='replicate'), kernel, groups=3)
+    
+    current = bchw_blur
+    while current_w > target_w * 2 or current_h > target_h * 2:
+        new_w = max(target_w, current_w // 2)
+        new_h = max(target_h, current_h // 2)
+        new_w = _round_to(new_w, 8)
+        new_h = _round_to(new_h, 8)
+        current = _resize_bchw(current, new_w, new_h, "area")
+        current_w, current_h = new_w, new_h
+    
+    if current_w != target_w or current_h != target_h:
+        current = _resize_bchw(current, target_w, target_h, "area")
+    
+    return current
+
 class QI_RefEditEncode_Safe:
     CATEGORY = "QI by wallen0322"
     RETURN_TYPES = ("CONDITIONING","IMAGE","LATENT")
@@ -379,35 +409,62 @@ class QI_RefEditEncode_Safe:
             hf_alpha, kstd, bias = 0.14, 0.82, 0.005
 
         if is_multi_image:
-            ref_scale = max(0.75, min(1.02, 1.02 - 0.25*emph))
-            e_mult = max(0.60, min(1.05, 1.0 - 0.50 * emph))
-            l_mult = max(0.80, min(1.05, 0.82 + 0.25 * (1.0 - emph)))
+            ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
+            e_mult = max(0.50, min(1.10, 1.0 - 0.65 * emph))
+            l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))
+            
+            pixM_e *= ref_scale * 0.92
+            pixM_l *= ref_scale * 0.95
+            pixE_e *= ref_scale
+            pixE_e *= e_mult * 0.90
+            pixM_e *= 0.85 * e_mult
+            pixM_l *= l_mult
+            pixL_l *= 0.95 * l_mult
+            
+            bchw_padded = _bchw(padded)
+            Ph, Pw = bchw_padded.shape[2], bchw_padded.shape[3]
+            total_pix_target = int(1024 * 1024)
+            scale_for_ref = (total_pix_target / float(Pw * Ph)) ** 0.5
+            Pw_ref = _round_to(max(8, int(round(Pw * scale_for_ref))), 8)
+            Ph_ref = _round_to(max(8, int(round(Ph * scale_for_ref))), 8)
+            
+            padded_ref_bchw = _gradual_downsample(bchw_padded, Pw_ref, Ph_ref)
+            padded_ref = padded_ref_bchw.movedim(1, -1)
+            padded_ref = _ensure_rgb3(padded_ref).clamp(0, 1)
+            
+            pixM = padded_ref if (pixM_e>0 or pixM_l>0) else None
+            pixE = _lowpass_ref(padded_ref, 64) if pixE_e>0 else None
+            pixL = None
+            
+            if pixM is not None:
+                pixM_processed = pixM.clamp(0, 1)
+                pixM = _color_lock_to(pixM_processed, padded_ref, mix=0.92)
+            if pixE is not None:
+                pixE_processed = pixE.clamp(0, 1)
+                pixE = _color_lock_to(pixE_processed, padded_ref, mix=0.90)
         else:
             ref_scale = max(0.75, min(1.03, 1.03 - 0.28*emph))
             e_mult = max(0.75, min(1.05, 1.0 - 0.35 * emph))
             l_mult = max(0.85, min(1.08, 0.88 + 0.20 * (1.0 - emph)))
-
-        pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
-        pixE_e *= e_mult
-        pixM_e *= 0.85 * e_mult
-        pixM_l *= l_mult
-        pixL_l *= 0.95 * l_mult
-
-        pixM = padded if (pixM_e>0 or pixM_l>0) else None
-        pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
-        pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, bias, 5) if pixL_l>0 else None
-
-        if is_multi_image:
-            if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.96)
-            if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.96)
-            if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.96)
-        else:
+            
+            pixM_e *= ref_scale
+            pixM_l *= ref_scale
+            pixE_e *= ref_scale
+            pixE_e *= e_mult
+            pixM_e *= 0.85 * e_mult
+            pixM_l *= l_mult
+            pixL_l *= 0.95 * l_mult
+            
+            pixM = padded if (pixM_e>0 or pixM_l>0) else None
+            pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
+            pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, bias, 5) if pixL_l>0 else None
+            
             if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.985)
             if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.99)
             if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.975)
 
         if is_multi_image:
-            early = (0.0, 0.55); late = (0.55, 1.0); hf_rng = (0.98, 1.0)
+            early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
         else:
             early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 1.0); hf_rng = (0.985, 1.0)
 
@@ -439,14 +496,11 @@ class QI_RefEditEncode_Safe:
             return c
 
         if is_multi_image:
-            lat_e_multi = float(lat_e * 0.75)
-            pixE_e_multi = float(pixE_e * 0.60)
-            pixM_e_multi = float(pixM_e * 0.70)
-            lat_l_multi = float(lat_l * 1.00)
-            pixM_l_multi = float(pixM_l * 0.80)
-            pixL_l_multi = float(pixL_l * 0.95)
-            cond = _add_ref(cond, early, lat_e_multi, pixE_e_multi, pixM_e_multi, 0.0, None)
-            cond = _add_ref(cond, late, lat_l_multi, 0.0, pixM_l_multi, pixL_l_multi, hf_rng)
+            lat_l_enh  = float(lat_l * 1.05)
+            pixM_l_enh = float(pixM_l * 0.80)
+            pixE_e_safe = float(pixE_e * 0.70)
+            cond = _add_ref(cond, early, 0.0, pixE_e_safe, 0.0, 0.0, None)
+            cond = _add_ref(cond, late, lat_l_enh, 0.0, pixM_l_enh, 0.0, hf_rng)
         else:
             cond = _add_ref(cond, early, lat_e*0.70, pixE_e*0.85, pixM_e*0.65, 0.0, None)
             cond = _add_ref(cond, mid, lat_l*0.95, 0.0, pixM_l*0.90, pixL_l*0.80, None)
