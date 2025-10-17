@@ -11,6 +11,12 @@ _VL_MAX_PIX = 1_400_000
 def _ceil_to(v: int, m: int) -> int:
     return ((v + m - 1) // m) * m if m > 1 else v
 
+def _floor_to(v: int, m: int) -> int:
+    return (v // m) * m if m > 1 else v
+
+def _round_to(v: int, m: int) -> int:
+    return round(v / m) * m if m > 1 else v
+
 def _to_bhwc_any(x):
     if isinstance(x, (list, tuple)):
         x = x[0]
@@ -67,15 +73,52 @@ def _resize_bchw_smart(x: torch.Tensor, w: int, h: int):
     _,_,H,W = x.shape
     return _resize_bchw(x, w, h, _choose_method(W,H,w,h))
 
+def _align_dimensions(W: int, H: int, max_pix: int = _SAFE_MAX_PIX):
+    """Align dimensions to optimal multiples to prevent pixel shift"""
+    area = W * H
+    if area > max_pix:
+        s = (max_pix / float(area)) ** 0.5
+        W = int(W * s)
+        H = int(H * s)
+    
+    W_112 = _round_to(W, 112)
+    H_112 = _round_to(H, 112)
+    if abs(W_112 - W) <= 56 and abs(H_112 - H) <= 56:
+        W, H = W_112, H_112
+    
+    W_64 = _round_to(W, 64)
+    H_64 = _round_to(H, 64)
+    if abs(W_64 - W) <= 32 and abs(H_64 - H) <= 32:
+        W, H = W_64, H_64
+    
+    W = _ceil_to(max(8, W), 8)
+    H = _ceil_to(max(8, H), 8)
+    
+    return W, H
+
 def _letterbox(src_bhwc: torch.Tensor, Wt: int, Ht: int, pad_mode: str="reflect"):
     B,H,W,C = src_bhwc.shape
     if W==Wt and H==Ht:
         return src_bhwc, dict(top=0,bottom=0,left=0,right=0)
     s = min(Wt/float(W), Ht/float(H))
-    Wr = max(1, int(round(W*s))); Hr = max(1, int(round(H*s)))
+    Wr = max(1, int(round(W*s)))
+    Hr = max(1, int(round(H*s)))
+    Wr = _round_to(Wr, 8)
+    Hr = _round_to(Hr, 8)
+    Wr = max(8, min(Wr, Wt))
+    Hr = max(8, min(Hr, Ht))
+    
     base = _ensure_rgb3(_resize_bchw_smart(_bchw(src_bhwc), Wr, Hr).movedim(1,-1))
-    top = (Ht - Hr)//2; bottom = Ht-Hr-top
-    left = (Wt - Wr)//2; right  = Wt-Wr-left
+    top = (Ht - Hr)//2
+    bottom = Ht - Hr - top
+    left = (Wt - Wr)//2
+    right = Wt - Wr - left
+    
+    top = (top // 2) * 2
+    bottom = Ht - Hr - top
+    left = (left // 2) * 2
+    right = Wt - Wr - left
+    
     bchw = _bchw(base)
     if top>0 or bottom>0 or left>0 or right>0:
         h, w = int(bchw.shape[2]), int(bchw.shape[3])
@@ -255,18 +298,18 @@ class QI_RefEditEncode_Safe:
         Wt = int(out_width) if int(out_width)>0 else W
         Ht = int(out_height) if int(out_height)>0 else H
 
-        area = Wt*Ht
-        if area > _SAFE_MAX_PIX:
-            s = (_SAFE_MAX_PIX/float(area))**0.5
-            Wt = max(8, int(Wt*s)); Ht = max(8, int(Ht*s))
-
-        Wc = _ceil_to(Wt, _ALIGN_M); Hc = _ceil_to(Ht, _ALIGN_M)
+        Wt, Ht = _align_dimensions(Wt, Ht, _SAFE_MAX_PIX)
+        Wc = _ceil_to(Wt, _ALIGN_M)
+        Hc = _ceil_to(Ht, _ALIGN_M)
 
         letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
         top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
         ph, pw = Hc - Ht, Wc - Wt
         if ph>0 or pw>0:
-            t2 = ph//2; b2 = ph - t2; l2 = pw//2; r2 = pw - l2
+            t2 = (ph//2 // 2) * 2
+            b2 = ph - t2
+            l2 = (pw//2 // 2) * 2
+            r2 = pw - l2
             bchw = _bchw(letter)
             h, w = int(bchw.shape[2]), int(bchw.shape[3])
             _mode = "reflect"
@@ -291,15 +334,15 @@ class QI_RefEditEncode_Safe:
             total = int(384 * 384)
             Hs, Ws = samples.shape[2], samples.shape[3]
             scale_by = (total / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
-            width  = max(1, int(round(Ws * scale_by)))
-            height = max(1, int(round(Hs * scale_by)))
+            width  = _round_to(max(8, int(round(Ws * scale_by))), 8)
+            height = _round_to(max(8, int(round(Hs * scale_by))), 8)
             s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
             images_vl.append(s.movedim(1, -1))
             if vae is not None:
                 total_l = int(1024 * 1024)
                 scale_by_l = (total_l / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
-                width_l  = max(8, int(round(Ws * scale_by_l / 8.0)) * 8)
-                height_l = max(8, int(round(Hs * scale_by_l / 8.0)) * 8)
+                width_l  = _round_to(max(8, int(round(Ws * scale_by_l))), 8)
+                height_l = _round_to(max(8, int(round(Hs * scale_by_l))), 8)
                 s_l = comfy.utils.common_upscale(samples, width_l, height_l, "area", "disabled")
                 ref_latents.append(vae.encode(s_l.movedim(1,-1)[:, :, :, :3]))
             image_prompt += f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>"
@@ -336,9 +379,9 @@ class QI_RefEditEncode_Safe:
             hf_alpha, kstd, bias = 0.14, 0.82, 0.005
 
         if is_multi_image:
-            ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
-            e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))
-            l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))
+            ref_scale = max(0.75, min(1.02, 1.02 - 0.25*emph))
+            e_mult = max(0.60, min(1.05, 1.0 - 0.50 * emph))
+            l_mult = max(0.80, min(1.05, 0.82 + 0.25 * (1.0 - emph)))
         else:
             ref_scale = max(0.75, min(1.03, 1.03 - 0.28*emph))
             e_mult = max(0.75, min(1.05, 1.0 - 0.35 * emph))
@@ -355,16 +398,16 @@ class QI_RefEditEncode_Safe:
         pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, bias, 5) if pixL_l>0 else None
 
         if is_multi_image:
-            if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.97)
-            if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.97)
-            if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.97)
+            if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.96)
+            if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.96)
+            if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.96)
         else:
             if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.985)
             if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.99)
             if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.975)
 
         if is_multi_image:
-            early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
+            early = (0.0, 0.55); late = (0.55, 1.0); hf_rng = (0.98, 1.0)
         else:
             early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 1.0); hf_rng = (0.985, 1.0)
 
@@ -396,10 +439,14 @@ class QI_RefEditEncode_Safe:
             return c
 
         if is_multi_image:
-            lat_l_enh  = float(lat_l * 1.10)
-            pixM_l_enh = float(pixM_l * 0.85)
-            pixL_l_enh = float(pixL_l * 1.12)
-            cond = _add_ref(cond, late, lat_l_enh, 0.0, pixM_l_enh, pixL_l_enh, hf_rng)
+            lat_e_multi = float(lat_e * 0.75)
+            pixE_e_multi = float(pixE_e * 0.60)
+            pixM_e_multi = float(pixM_e * 0.70)
+            lat_l_multi = float(lat_l * 1.00)
+            pixM_l_multi = float(pixM_l * 0.80)
+            pixL_l_multi = float(pixL_l * 0.95)
+            cond = _add_ref(cond, early, lat_e_multi, pixE_e_multi, pixM_e_multi, 0.0, None)
+            cond = _add_ref(cond, late, lat_l_multi, 0.0, pixM_l_multi, pixL_l_multi, hf_rng)
         else:
             cond = _add_ref(cond, early, lat_e*0.70, pixE_e*0.85, pixM_e*0.65, 0.0, None)
             cond = _add_ref(cond, mid, lat_l*0.95, 0.0, pixM_l*0.90, pixL_l*0.80, None)
