@@ -13,6 +13,6 @@ Repository = "https://github.com/wallen0322/ComfyUI-QI-QwenEditSafe"
 Issues = "https://github.com/wallen0322/ComfyUI-QI-QwenEditSafe/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "wallen"
 DisplayName = "ComfyUI-QI-QwenEditSafe"
 Icon = "https://raw.githubusercontent.com/wallen0322/ComfyUI-QI-QwenEditSafe/main/example_workflows/icon.png"
