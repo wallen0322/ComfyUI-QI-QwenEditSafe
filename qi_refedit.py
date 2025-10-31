@@ -1,19 +1,29 @@
 from __future__ import annotations
 import torch
 import torch.nn.functional as F
-import node_helpers, comfy.utils
+import node_helpers
+import comfy.utils
 
-# -------------------- constants --------------------
-_ALIGN_M = 32                 # internal compute multiple
-_SAFE_MAX_PIX = 3_000_000     # hard cap for compute (3MP)
-_VL_MAX_PIX = 1_400_000       # visual input cap for CLIP vision (1.4MP)
+_ALIGN_M = 32
+_SAFE_MAX_PIX = 3_000_000
+_VL_MAX_PIX = 1_400_000
 
-# -------------------- basic image helpers --------------------
+_compute_cache = {}
+
+def _clear_cache():
+    global _compute_cache
+    _compute_cache.clear()
+
 def _ceil_to(v: int, m: int) -> int:
     return ((v + m - 1) // m) * m if m > 1 else v
 
+def _floor_to(v: int, m: int) -> int:
+    return (v // m) * m if m > 1 else v
+
+def _round_to(v: int, m: int) -> int:
+    return round(v / m) * m if m > 1 else v
+
 def _to_bhwc_any(x):
-    # accept Tensor or (list/tuple/dict)->first tensor
     if isinstance(x, (list, tuple)):
         x = x[0]
     if isinstance(x, dict):
@@ -23,14 +33,14 @@ def _to_bhwc_any(x):
     t = x
     if not isinstance(t, torch.Tensor):
         raise RuntimeError("Unsupported image container")
-    if t.ndim == 2:      # H,W -> B,H,W,C=1
+    if t.ndim == 2:
         t = t.unsqueeze(0).unsqueeze(-1)
-    elif t.ndim == 3:    # CHW or HWC -> BHWC
+    elif t.ndim == 3:
         if t.shape[0] in (1,3,4):
             t = t.unsqueeze(0).movedim(1, -1)
         else:
             t = t.unsqueeze(0)
-    elif t.ndim == 4:    # BCHW or BHWC -> BHWC
+    elif t.ndim == 4:
         if t.shape[-1] in (1,3,4):
             pass
         elif t.shape[1] in (1,3,4):
@@ -40,58 +50,73 @@ def _to_bhwc_any(x):
     else:
         raise RuntimeError(f"Unsupported tensor shape for image: {tuple(t.shape)}")
     t = t.float()
-    if t.min().item() < 0.0:   # [-1,1] -> [0,1]
+    if t.min().item() < 0.0:
         t = (t + 1.0) * 0.5
     if t.shape[-1] == 1:
         t = t.repeat(1,1,1,3)
-    return t.clamp(0,1).contiguous()
+    return t.contiguous()
 
-def _ensure_rgb3(bhwc: torch.Tensor) -> torch.Tensor:
-    if bhwc.shape[-1] == 3: return bhwc
-    if bhwc.shape[-1] == 1: return bhwc.repeat(1,1,1,3)
-    return bhwc[...,:3]
+def _bchw(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[-1] in (1,3,4):
+        x = x.movedim(-1, 1)
+    return x
 
-def _bhwc(x):  # IMAGE -> BHWC
-    return _ensure_rgb3(_to_bhwc_any(x))
+def _resize_bchw_smart(x: torch.Tensor, W: int, H: int) -> torch.Tensor:
+    x = _bchw(x)
+    b, c, h, w = x.shape
+    if h==H and w==W:
+        return x
+    out = comfy.utils.common_upscale(x, W, H, upscale_method="lanczos", crop="center")
+    return out
 
-def _bchw(x):  # IMAGE -> BCHW
-    return _bhwc(x).movedim(-1, 1).contiguous()
+def _ensure_rgb3(x: torch.Tensor) -> torch.Tensor:
+    x = _bchw(x)
+    b, c, h, w = x.shape
+    if c==1:
+        return x.repeat(1,3,1,1)
+    elif c==4:
+        return x[:, :3]
+    elif c==3:
+        return x
+    else:
+        raise RuntimeError(f"Unsupported channel count: {c}")
 
-def _choose_method(sw, sh, tw, th):
-    if tw*th <= 0: return "area"
-    if tw >= sw or th >= sh: return "lanczos"
-    return "area"
-
-def _resize_bchw(x: torch.Tensor, w: int, h: int, method: str):
-    return comfy.utils.common_upscale(x, w, h, method, "disabled")
-
-def _resize_bchw_smart(x: torch.Tensor, w: int, h: int):
-    _,_,H,W = x.shape
-    return _resize_bchw(x, w, h, _choose_method(W,H,w,h))
-
-def _letterbox(src_bhwc: torch.Tensor, Wt: int, Ht: int, pad_mode: str="reflect"):
-    B,H,W,C = src_bhwc.shape
+def _letterbox_fit(src_bhwc: torch.Tensor, Wt: int, Ht: int, pad_mode: str="reflect") -> tuple[torch.Tensor, dict]:
+    W, H = int(src_bhwc.shape[2]), int(src_bhwc.shape[1])
+    Wt = _ceil_to(Wt, 8)
+    Ht = _ceil_to(Ht, 8)
+    Wt = max(8, min(Wt, _floor_to(_SAFE_MAX_PIX**0.5 * 8, 8)))
+    Ht = max(8, min(Ht, _floor_to(_SAFE_MAX_PIX**0.5 * 8, 8)))
     if W==Wt and H==Ht:
         return src_bhwc, dict(top=0,bottom=0,left=0,right=0)
     s = min(Wt/float(W), Ht/float(H))
-    Wr = max(1, int(round(W*s))); Hr = max(1, int(round(H*s)))
+    Wr = max(1, int(round(W*s)))
+    Hr = max(1, int(round(H*s)))
+    Wr = _round_to(Wr, 8)
+    Hr = _round_to(Hr, 8)
+    Wr = max(8, min(Wr, Wt))
+    Hr = max(8, min(Hr, Ht))
+    
     base = _ensure_rgb3(_resize_bchw_smart(_bchw(src_bhwc), Wr, Hr).movedim(1,-1))
-    top = (Ht - Hr)//2; bottom = Ht-Hr-top
-    left = (Wt - Wr)//2; right  = Wt-Wr-left
+    top = (Ht - Hr)//2
+    bottom = Ht - Hr - top
+    left = (Wt - Wr)//2
+    right = Wt - Wr - left
+    
+    top = (top // 2) * 2
+    bottom = Ht - Hr - top
+    left = (left // 2) * 2
+    right = Wt - Wr - left
+    
     bchw = _bchw(base)
     if top>0 or bottom>0 or left>0 or right>0:
-        bchw = F.pad(bchw, (left,right,top,bottom), mode=pad_mode)
+        h, w = int(bchw.shape[2]), int(bchw.shape[3])
+        mode = pad_mode
+        if h < 2 or w < 2 or left >= w or right >= w or top >= h or bottom >= h:
+            mode = "replicate"
+        bchw = F.pad(bchw, (left,right,top,bottom), mode=mode)
     return _ensure_rgb3(bchw.movedim(1,-1)), dict(top=int(top),bottom=int(bottom),left=int(left),right=int(right))
 
-def _cap_vl(img_bhwc: torch.Tensor) -> torch.Tensor:
-    H,W = int(img_bhwc.shape[1]), int(img_bhwc.shape[2])
-    area = H*W
-    if area <= _VL_MAX_PIX: return img_bhwc
-    s = (_VL_MAX_PIX/float(area))**0.5
-    Hs = max(1,int(H*s)); Ws = max(1,int(W*s))
-    return _ensure_rgb3(_resize_bchw_smart(_bchw(img_bhwc), Ws, Hs).movedim(1,-1))
-
-# -------------------- color helpers (Linear BT.709) --------------------
 def _smoothstep(a: float, b: float, x: torch.Tensor) -> torch.Tensor:
     t = (x - a) / max(1e-6, (b - a))
     t = t.clamp(0.0, 1.0)
@@ -105,284 +130,216 @@ def _linear_to_srgb(t: torch.Tensor) -> torch.Tensor:
     t = t.clamp(0.0, 1.0)
     return torch.where(t <= 0.0031308, t*12.92, 1.055*torch.pow(t, 1.0/2.4) - 0.055)
 
-# 2x2 Cholesky for SPD [[a,b],[b,c]]
 def _chol2x2(a,b,c, eps=1e-8):
     a = torch.clamp(a, min=eps)
     l11 = torch.sqrt(a)
     l21 = b / l11
     t = torch.clamp(c - l21*l21, min=eps)
     l22 = torch.sqrt(t)
-    # L = [[l11,0],[l21,l22]], invL:
     inv_l11 = 1.0/l11
     inv_l22 = 1.0/l22
-    inv_l21 = -l21 * inv_l11 * inv_l22
-    return l11, l21, l22, inv_l11, inv_l21, inv_l22
+    return l11, l21, l22, inv_l11, inv_l22
 
-def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
-    # build robust midtone mask & exclude near-gray
-    B,_,H,W = Yx.shape
-    yv = Yx.reshape(B,1,H*W)
-    lo = torch.quantile(yv, 0.06, dim=-1, keepdim=True).reshape(B,1,1,1)
-    hi = torch.quantile(yv, 0.94, dim=-1, keepdim=True).reshape(B,1,1,1)
-    mask = (Yx>=lo) & (Yx<=hi)
-    # exclude very low chroma
-    chroma2 = Cbx*Cbx + Crx*Crx
-    mask = mask & (chroma2 > 8e-4)
+def _make_ref_images(base_bhwc: torch.Tensor, target_size: tuple[int,int], batch_idxs: list[int] = None):
+    target_H, target_W = target_size
+    H, W = int(base_bhwc.shape[1]), int(base_bhwc.shape[2])
+    
+    if batch_idxs is None:
+        batch_idxs = list(range(base_bhwc.shape[0]))
+    
+    ref_images = {}
+    
+    if H>0 and W>0 and target_H>0 and target_W>0:
+        s_low = min(target_W/W, target_H/H) * 0.25
+        s_base = min(target_W/W, target_H/H)
+        s_high = min(target_W/W, target_H/H) * 2.0
+        
+        for i in batch_idxs:
+            low_bchw = _resize_bchw_smart(_bchw(base_bhwc[i:i+1]), max(1, int(W*s_low)), max(1, int(H*s_low)))
+            base_bchw = _resize_bchw_smart(_bchw(base_bhwc[i:i+1]), max(1, int(W*s_base)), max(1, int(H*s_base)))
+            high_bchw = _resize_bchw_smart(_bchw(base_bhwc[i:i+1]), max(1, int(W*s_high)), max(1, int(H*s_high)))
+            
+            low = _ensure_rgb3(low_bchw).movedim(1, -1)[0]
+            base = _ensure_rgb3(base_bchw).movedim(1, -1)[0]
+            high = _ensure_rgb3(high_bchw).movedim(1, -1)[0]
+            
+            ref_images[f"{i}_low"] = low
+            ref_images[f"{i}_base"] = base
+            ref_images[f"{i}_high"] = high
+            
+    return ref_images
 
-    m = mask.float()
-    denom = m.sum(dim=(2,3), keepdim=True).clamp_min(1.0)
+def _to_ycbcr(t: torch.Tensor) -> torch.Tensor:
+    t = _bchw(t)
+    r, g, b = t[:,0], t[:,1], t[:,2]
+    y = 0.299*r + 0.587*g + 0.114*b
+    cb = (b - y)*0.564
+    cr = (r - y)*0.713
+    return torch.stack([y, cb, cr], dim=1)
 
-    def _stats(Cb, Cr):
-        mu_cb = (Cb*m).sum(dim=(2,3), keepdim=True)/denom
-        mu_cr = (Cr*m).sum(dim=(2,3), keepdim=True)/denom
-        dcb = (Cb - mu_cb)*m
-        dcr = (Cr - mu_cr)*m
-        a = (dcb*(Cb - mu_cb)).sum(dim=(2,3), keepdim=True)/denom + 1e-6
-        c = (dcr*(Cr - mu_cr)).sum(dim=(2,3), keepdim=True)/denom + 1e-6
-        b = (dcb*(Cr - mu_cr)).sum(dim=(2,3), keepdim=True)/denom
-        return mu_cb, mu_cr, a.squeeze(), b.squeeze(), c.squeeze()
+def _from_ycbcr(y_cb_cr: torch.Tensor) -> torch.Tensor:
+    y, cb, cr = y_cb_cr[:,0], y_cb_cr[:,1], y_cb_cr[:,2]
+    r = y + 1.403*cr
+    g = y - 0.344*cb - 0.714*cr
+    b = y + 1.773*cb
+    return torch.stack([r, g, b], dim=1)
 
-    mu_x_cb, mu_x_cr, ax, bx, cx = _stats(Cbx, Crx)
-    mu_r_cb, mu_r_cr, ar, br, cr = _stats(Cbr, Crr)
+def _clip_chroma_stats_ycbcr(images: torch.Tensor) -> torch.Tensor:
+    ycbcr = _to_ycbcr(_ensure_rgb3(images))
+    cb, cr = ycbcr[:,1], ycbcr[:,2]
+    mean_cb = torch.mean(cb, dim=[2,3], keepdim=True)
+    mean_cr = torch.mean(cr, dim=[2,3], keepdim=True)
+    var_cb = torch.var(cb, dim=[2,3], keepdim=True)
+    var_cr = torch.var(cr, dim=[2,3], keepdim=True)
+    cov_cbcr = torch.mean((cb-mean_cb)*(cr-mean_cr), dim=[2,3], keepdim=True)
+    
+    eps = 1e-6
+    a = torch.clamp(var_cb, min=eps)
+    b = cov_cbcr
+    c = torch.clamp(var_cr, min=eps)
+    
+    l11, l21, l22, inv_l11, inv_l22 = _chol2x2(a, b, c, eps)
+    
+    def transform(cb_t, cr_t):
+        cb_adj = cb_t - mean_cb
+        cr_adj = cr_t - mean_cr
+        l21_cb = l21*cb_adj
+        temp = cr_adj - l21_cb
+        l11_cb = l11*cb_adj
+        l22_temp = l22*temp
+        out_cb = inv_l11*l11_cb
+        out_cr = inv_l22*l22_temp
+        return out_cb + mean_cb, out_cr + mean_cr
+        
+    return transform
 
-    # Cholesky whiten->color: T = Lr @ inv(Lx)
-    l11x, l21x, l22x, inv11x, inv21x, inv22x = _chol2x2(ax, bx, cx)
-    l11r, l21r, l22r, _, _, _ = _chol2x2(ar, br, cr)
+def _prepare_reference_conditioning(reference_images: dict, images_bhwc: torch.Tensor, conditioning_timesteps: torch.Tensor, true_cfg_scale: float = 1.0) -> dict:
+    ref_count = len(reference_images) // 3
+    ref_cond = dict()
+    
+    for i in range(ref_count):
+        low = reference_images[f"{i}_low"]
+        base = reference_images[f"{i}_base"] 
+        high = reference_images[f"{i}_high"]
+        
+        low_cond = node_helpers.conditioning_set_values(images_bhwc, conditioning_timesteps, 
+                                                       {"low_res_ref": low, "ref_idx": i})
+        base_cond = node_helpers.conditioning_set_values(images_bhwc, conditioning_timesteps,
+                                                         {"ref_res_base": base, "ref_idx": i})
+        high_cond = node_helpers.conditioning_set_values(images_bhwc, conditioning_timesteps,
+                                                         {"high_res_ref": high, "ref_idx": i})
+        
+        ref_cond[f"{i}"] = [low_cond, base_cond, high_cond]
+    
+    if "chromalock_transform" in reference_images:
+        transform = reference_images["chromalock_transform"]
+        ref_cond["chromalock"] = transform
+        
+    if true_cfg_scale > 1.0:
+        ref_cond["true_cfg_scale"] = true_cfg_scale
+        
+    return ref_cond
 
-    # inv(Lx) = [[inv11x, 0],[inv21x, inv22x]]
-    # Lr = [[l11r,0],[l21r,l22r]]
-    t00 = l11r*inv11x + 0.0*inv21x
-    t01 = l11r*0.0    + 0.0*inv22x
-    t10 = l21r*inv11x + l22r*inv21x
-    t11 = l21r*0.0    + l22r*inv22x
-
-    # clamp transform: diag within ±3%, off-diag within ±0.02
-    t00 = t00.clamp(0.97, 1.03)
-    t11 = t11.clamp(0.97, 1.03)
-    t01 = t01.clamp(-0.02, 0.02)
-    t10 = t10.clamp(-0.02, 0.02)
-
-    # mean shift clamp ±0.003
-    dmu_cb = (mu_r_cb - mu_x_cb).clamp(-0.003, 0.003)
-    dmu_cr = (mu_r_cr - mu_x_cr).clamp(-0.003, 0.003)
-
-    # brightness-adaptive conservative factor for very bright scenes
-    meanY = Yx.mean(dim=(2,3), keepdim=True)  # Bx1x1x1
-    k = 1.0 - torch.clamp(meanY - 0.7, min=0.0, max=0.1) * 0.4  # 0.8..1.0
-    t00 = 1.0 + (t00 - 1.0)*k
-    t11 = 1.0 + (t11 - 1.0)*k
-    t01 = t01 * k
-    t10 = t10 * k
-    dmu_cb = dmu_cb * k
-    dmu_cr = dmu_cr * k
-
-    return (t00,t01,t10,t11), (dmu_cb,dmu_cr), (mu_x_cb,mu_x_cr)
-
-def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.97) -> torch.Tensor:
-    # sRGB -> linear
-    x = _bchw(x_bhwc); r = _bchw(ref_bhwc)
-    x_lin = _srgb_to_linear(x); r_lin = _srgb_to_linear(r)
-
-    R,G,B   = x_lin[:,0:1], x_lin[:,1:2], x_lin[:,2:3]
-    Rr,Gr,Br= r_lin[:,0:1], r_lin[:,1:2], r_lin[:,2:3]
-
-    # BT.709 YCbCr (linear)
-    Yx = 0.2126*R + 0.7152*G + 0.0722*B
-    Yr = 0.2126*Rr + 0.7152*Gr + 0.0722*Br
-    cb_s = 0.5/(1.0-0.0722); cr_s = 0.5/(1.0-0.2126)
-    Cbx = (B - Yx)*cb_s; Crx = (R - Yx)*cr_s
-    Cbr = (Br - Yr)*cb_s; Crr = (Rr - Yr)*cr_s
-
-    # 2x2 stats & transform
-    (t00,t01,t10,t11), (dmu_cb,dmu_cr), (mu_x_cb,mu_x_cr) = _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx)
-
-    # apply per-pixel: v' = T (v - mu_x) + (mu_x + dmu)
-    cb = Cbx - mu_x_cb; cr = Crx - mu_x_cr
-    Cb_aligned = t00*cb + t01*cr + (mu_x_cb + dmu_cb)
-    Cr_aligned = t10*cb + t11*cr + (mu_x_cr + dmu_cr)
-
-    # reconstruct RGB (preserve Y)
-    inv_cb = 1.0/cb_s; inv_cr = 1.0/cr_s
-    R2 = Yx + Cr_aligned*inv_cr
-    B2 = Yx + Cb_aligned*inv_cb
-    G2 = (Yx - 0.2126*R2 - 0.0722*B2) / 0.7152
-    aligned = torch.cat([R2,G2,B2], dim=1).clamp(0,1)
-
-    # highlight/lowlight attenuation for blending
-    w_hi = 1.0 - _smoothstep(0.74, 0.93, Yx)
-    w_lo = _smoothstep(0.05, 0.12, Yx)
-    w = (mix * w_hi * w_lo).clamp(0.0, 1.0)
-
-    out_lin = w*aligned + (1.0 - w)*x_lin
-    out = _linear_to_srgb(out_lin).movedim(1,-1)
-    return _ensure_rgb3(out)
-
-# -------------------- reference builders (unchanged) --------------------
-def _lowpass_ref(bhwc: torch.Tensor, size: int=64) -> torch.Tensor:
-    bchw = _bchw(bhwc)
-    bh = F.interpolate(bchw, size=(size,size), mode="area")
-    bh = _resize_bchw_smart(bh, bchw.shape[-1], bchw.shape[-2])
-    return _ensure_rgb3(bh.movedim(1,-1)).clamp(0,1)
-
-def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bias: float, smooth_k: int) -> torch.Tensor:
-    bchw = _bchw(bhwc)
-    k = max(3, blur_k|1); pad = k//2
-    if bchw.shape[2] <= pad or bchw.shape[3] <= pad:
-        return _ensure_rgb3(bchw.movedim(1,-1))
-    base = F.avg_pool2d(bchw, kernel_size=k, stride=1, padding=pad)
-    detail = bchw - base
-    ker = torch.ones((1,1,3,3), dtype=bchw.dtype, device=bchw.device)/9.0
-    y = (_bchw(bhwc)[:,0:1]*0.299 + _bchw(bhwc)[:,1:2]*0.587 + _bchw(bhwc)[:,2:3]*0.114)
-    mu = F.conv2d(F.pad(y,(1,1,1,1), mode="replicate"), ker)
-    var= F.conv2d(F.pad((y-mu)**2,(1,1,1,1), mode="replicate"), ker)
-    std= torch.sqrt(var + 1e-6)
-    t  = kstd*std + bias
-    absd = torch.abs(detail)
-    t3 = torch.cat([t,t,t], dim=1)
-    d = torch.sign(detail) * torch.clamp(absd - t3, min=0.0)
-    # texture/edge gates
-    sobel_x = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=y.dtype, device=y.device).view(1,1,3,3)/8.0
-    sobel_y = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=y.dtype, device=y.device).view(1,1,3,3)/8.0
-    e = torch.sqrt(F.conv2d(F.pad(y,(1,1,1,1),mode="replicate"), sobel_x)**2 +
-                   F.conv2d(F.pad(y,(1,1,1,1),mode="replicate"), sobel_y)**2) + 1e-6
-    mid = torch.exp(-((y-0.5)**2)/(2*0.25*0.25))
-    tex = (std/(std.mean(dim=(2,3), keepdim=True)+1e-6)).clamp(0,1.5)
-    tex = (tex - 0.2)/0.8; tex = tex.clamp(0,1)
-    gate = (0.16 + 0.40*(e/(e.mean(dim=(2,3), keepdim=True)*3.0)) + 0.10*tex) * (0.85 + 0.15*mid)
-    gate3 = torch.cat([gate,gate,gate], dim=1)
-    dm = torch.tanh(d*2.0)*0.38
-    out = (bchw + alpha*(dm*gate3)).clamp(0,1)
-    return _ensure_rgb3(out.movedim(1,-1))
-
-# -------------------- node class --------------------
 class QI_RefEditEncode_Safe:
-    CATEGORY = "QI by wallen0322"
-    RETURN_TYPES = ("CONDITIONING","IMAGE","LATENT")
-    RETURN_NAMES = ("conditioning","image","latent")
-    FUNCTION = "encode"
-
+    def __init__(self):
+        pass
+    
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(s):
         return {"required": {
-            "clip": ("CLIP",),
-            "prompt": ("STRING", {"multiline": True, "default": ""}),
-            "image": ("IMAGE",),
-            "vae": ("VAE",),
-            "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-            "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-            "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"}),
+            "images": ("IMAGE",),
+            "target_resolution": ("STRING", {"default": "1024x1024", "multiline": False}),
+        }, "optional": {
+            "reference_image": ("IMAGE",),
+            "reference_resolution": ("STRING", {"default": "512x512", "multiline": False}),
+            "color_lock": ("BOOLEAN", {"default": True}),
+            "use_cache": ("BOOLEAN", {"default": True}),
+            "true_cfg_scale": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 20.0}),
         }}
+    
+    RETURN_TYPES = ("CONDITIONING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("ref_conditioning", "prompt_template", "placeholder_tokens", "image_shapes")
+    FUNCTION = "encode"
+    CATEGORY = "Qwen2.5"
 
-    def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural"):
-        # source/output sizes
-        src = _bhwc(image)[...,:3]
-        H,W = int(src.shape[1]), int(src.shape[2])
-        Wt = int(out_width) if int(out_width)>0 else W
-        Ht = int(out_height) if int(out_height)>0 else H
+    def encode(self, images: torch.Tensor, target_resolution: str, reference_image: torch.Tensor=None, 
+               reference_resolution: str="512x512", color_lock: bool=True, use_cache: bool=True, true_cfg_scale: float=3.0):
+        try:
+            Wt, Ht = [int(x) for x in target_resolution.split("x")]
+            Wr, Hr = [int(x) for x in reference_resolution.split("x")]
+            
+            images_bhwc = _to_bhwc_any(images)
+            base_H, base_W = images_bhwc.shape[1], images_bhwc.shape[2]
+            B = images_bhwc.shape[0]
+            
+            if Wt*Ht > _SAFE_MAX_PIX or Wr*Hr > _SAFE_MAX_PIX:
+                raise RuntimeError(f"Resolution too large: target {Wt}x{Ht}, ref {Wr}x{Hr}")
+            
+            if use_cache:
+                cache_key = f"{base_W}x{base_H}_{Wt}x{Ht}_{Wr}x{Hr}_{color_lock}_{true_cfg_scale}"
+                if cache_key in _compute_cache:
+                    cached_result = _compute_cache[cache_key]
+                    prompt_template = cached_result[1]
+                    placeholder_tokens = cached_result[2]
+                    image_shapes = cached_result[3]
+                else:
+                    ref_images = self._prepare_reference_images(images_bhwc, Wr, Hr, color_lock, use_cache)
+                    ref_cond = self._create_conditioning(ref_images, true_cfg_scale)
+                    prompt_template = self._create_prompt_template(B)
+                    placeholder_tokens = self._create_placeholder_tokens(B)
+                    image_shapes = f"{base_W}x{base_H}"
+                    
+                    _compute_cache[cache_key] = (ref_cond, prompt_template, placeholder_tokens, image_shapes)
+            else:
+                ref_images = self._prepare_reference_images(images_bhwc, Wr, Hr, color_lock, use_cache)
+                ref_cond = self._create_conditioning(ref_images, true_cfg_scale)
+                prompt_template = self._create_prompt_template(B)
+                placeholder_tokens = self._create_placeholder_tokens(B)
+                image_shapes = f"{base_W}x{base_H}"
+            
+            return (ref_cond, prompt_template, placeholder_tokens, image_shapes)
+            
+        except Exception as e:
+            raise RuntimeError(f"Reference encoding failed: {e}")
 
-        # hard compute cap
-        area = Wt*Ht
-        if area > _SAFE_MAX_PIX:
-            s = (_SAFE_MAX_PIX/float(area))**0.5
-            Wt = max(8, int(Wt*s)); Ht = max(8, int(Ht*s))
-
-        Wc = _ceil_to(Wt, _ALIGN_M); Hc = _ceil_to(Ht, _ALIGN_M)
-
-        # letterbox -> pad to compute size
-        letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
-        top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
-        ph, pw = Hc - Ht, Wc - Wt
-        if ph>0 or pw>0:
-            t2 = ph//2; b2 = ph - t2; l2 = pw//2; r2 = pw - l2
-            bchw = _bchw(letter)
-            bchw = F.pad(bchw, (l2,r2,t2,b2), mode="reflect")
-            letter = _ensure_rgb3(bchw.movedim(1,-1))
-            top+=t2; bottom+=b2; left+=l2; right+=r2
-        padded = letter.contiguous()
-
-        # CLIP tokens with VL cap
-        vl_img = _cap_vl(padded)
-        tokens = clip.tokenize(prompt, images=[vl_img])
-        cond = clip.encode_from_tokens_scheduled(tokens)
-
-        # VAE encode
-        with torch.inference_mode():
-            lat = vae.encode(padded)
-            if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
-            if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
-
-        # schedule weights (quality presets)
-        emph = float(max(0.0, min(1.0, prompt_emphasis)))
-        if quality_mode == "fast":
-            lat_e, pixM_e, pixE_e = 0.68, 0.42, 0.20; lat_l, pixM_l, pixL_l = 0.95, 0.78, 0.02; hf_alpha, kstd, bias, smooth = 0.14, 0.84, 0.0045, 5
-        elif quality_mode == "best":
-            lat_e, pixM_e, pixE_e = 0.76, 0.52, 0.26; lat_l, pixM_l, pixL_l = 1.05, 0.90, 0.03; hf_alpha, kstd, bias, smooth = 0.17, 0.90, 0.0045, 7
-        elif quality_mode == "balanced":
-            lat_e, pixM_e, pixE_e = 0.72, 0.48, 0.24; lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.025; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+    def _prepare_reference_images(self, images_bhwc, Wr, Hr, color_lock, use_cache):
+        ref_images = {}
+        B = images_bhwc.shape[0]
+        target_size = (Hr, Wr)
+        
+        cache_key = f"ref_images_{images_bhwc.shape}_{Hr}x{Wr}_{color_lock}"
+        if use_cache and cache_key in _compute_cache:
+            ref_images = _compute_cache[cache_key]
         else:
-            lat_e, pixM_e, pixE_e = 0.73, 0.49, 0.24; lat_l, pixM_l, pixL_l = 1.02, 0.86, 0.025; hf_alpha, kstd, bias, smooth = 0.16, 0.88, 0.0045, 5
+            if color_lock:
+                clip_transform = _clip_chroma_stats_ycbcr(images_bhwc)
+                ref_images["chromalock_transform"] = clip_transform
+                
+            ref_images.update(_make_ref_images(images_bhwc, target_size))
+            
+            if use_cache:
+                _compute_cache[cache_key] = ref_images
+                
+        return ref_images
 
-        # global scale by prompt_emphasis (keep latent always-locked)
-        ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
-        pixM_e *= ref_scale; pixM_l *= ref_scale; pixE_e *= ref_scale
+    def _create_conditioning(self, ref_images, true_cfg_scale):
+        B = len(ref_images) // 3 if "chromalock_transform" not in ref_images else (len(ref_images) - 1) // 3
+        conditioning_timesteps = torch.ones(B, dtype=torch.float32)
+        
+        ref_cond = _prepare_reference_conditioning(ref_images, ref_images.get("ref_images", {}), conditioning_timesteps, true_cfg_scale)
+        
+        return ref_cond
 
-        # ---- two-step adherence: early "more prompt", late "more consistency" ----
-        e_mult = max(0.5, min(1.1, 1.0 - 0.65 * emph))              # early: loosen pixels -> more prompt-following
-        l_mult = max(0.75, min(1.15, 0.75 + 0.40 * (1.0 - emph)))   # late : tighten pixels -> stronger consistency
+    def _create_prompt_template(self, B):
+        placeholders = []
+        for i in range(B):
+            placeholders.append(f"<image_{i}>")
+        
+        prompt_template = " ".join(placeholders)
+        return prompt_template
 
-        pixE_e *= e_mult
-        pixM_e *= 0.85 * e_mult
-        pixM_l *= l_mult
-        pixL_l *= 1.15 * l_mult   # only used in late hf range
-
-        # build references
-        pixM = padded if (pixM_e>0 or pixM_l>0) else None
-        pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
-        pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, 0.0045, smooth) if pixL_l>0 else None
-
-        # color-lock to original (reduce drift)
-        if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.97)
-        if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.97)
-        if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.97)
-
-        early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
-
-        def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
-            c = node_helpers.conditioning_set_values(c, {
-                "reference_latents": [lat],
-                "strength": float(lat_w),
-                "timestep_percent_range": [float(rng[0]), float(rng[1])],
-            }, append=True)
-            if pixE is not None and pixE_w>0:
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixE],
-                    "strength": float(pixE_w),
-                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                }, append=True)
-            if pixM is not None and pixM_w>0:
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixM],
-                    "strength": float(pixM_w),
-                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                }, append=True)
-            if pixL is not None and pixL_w>0:
-                r = hfr if hfr is not None else rng
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixL],
-                    "strength": float(pixL_w),
-                    "timestep_percent_range": [float(r[0]), float(r[1])],
-                }, append=True)
-            return c
-
-        cond = _add_ref(cond, early, lat_e, pixE_e, pixM_e, 0.0, None)
-        cond = _add_ref(cond, late,  lat_l, 0.0,    pixM_l, pixL_l, hf_rng)
-
-        latent = {"samples": lat,
-                  "qi_pad": {"top": int(top), "bottom": int(bottom), "left": int(left), "right": int(right),
-                             "orig_h": int(Ht), "orig_w": int(Wt),
-                             "compute_h": int(padded.shape[1]), "compute_w": int(padded.shape[2])}}
-        return (cond, _ensure_rgb3(_bhwc(image)), latent)
-
-NODE_CLASS_MAPPINGS = {"QI_RefEditEncode_Safe": QI_RefEditEncode_Safe}
-NODE_DISPLAY_NAME_MAPPINGS = {"QI_RefEditEncode_Safe": "Qwen一致性编辑编码器 — by wallen0322"}
+    def _create_placeholder_tokens(self, B):
+        tokens = []
+        for i in range(B):
+            tokens.append(f"<image_{i}>")
+        return " ".join(tokens)
