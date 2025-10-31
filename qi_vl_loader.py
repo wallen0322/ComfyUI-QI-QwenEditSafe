@@ -3,152 +3,204 @@ import torch
 import torch.nn.functional as F
 import comfy.utils
 
-# ---------- helpers (IMAGE: BHWC in [0,1]) ----------
-def _to_bhwc(img):
-    t = img
-    if isinstance(t, (list, tuple)):
-        t = t[0]
+_ALIGN_M = 32
+_SAFE_MAX_PIX = 3_000_000
+_VL_MAX_PIX = 1_400_000
+
+_compute_cache = {}
+
+def _clear_cache():
+    global _compute_cache
+    _compute_cache.clear()
+
+def _ceil_to(v: int, m: int) -> int:
+    return ((v + m - 1) // m) * m if m > 1 else v
+
+def _floor_to(v: int, m: int) -> int:
+    return (v // m) * m if m > 1 else v
+
+def _round_to(v: int, m: int) -> int:
+    return round(v / m) * m if m > 1 else v
+
+def _to_bhwc_any(x):
+    if isinstance(x, (list, tuple)):
+        x = x[0]
+    if isinstance(x, dict):
+        for k in ("image","images","samples","data","result"):
+            if k in x and isinstance(x[k], torch.Tensor):
+                x = x[k]; break
+    t = x
     if not isinstance(t, torch.Tensor):
-        raise RuntimeError("Invalid IMAGE")
+        raise RuntimeError("Unsupported image container")
     if t.ndim == 2:
         t = t.unsqueeze(0).unsqueeze(-1)
     elif t.ndim == 3:
         if t.shape[0] in (1,3,4):
-            t = t.unsqueeze(0).movedim(1,-1)
+            t = t.unsqueeze(0).movedim(1, -1)
         else:
             t = t.unsqueeze(0)
     elif t.ndim == 4:
-        if t.shape[-1] in (1,3,4): pass
-        elif t.shape[1] in (1,3,4): t = t.movedim(1,-1)
-        else: t = t.movedim(1,-1)
+        if t.shape[-1] in (1,3,4):
+            pass
+        elif t.shape[1] in (1,3,4):
+            t = t.movedim(1, -1)
+        else:
+            t = t.movedim(1, -1)
     else:
-        raise RuntimeError("Unsupported IMAGE shape")
+        raise RuntimeError(f"Unsupported tensor shape for image: {tuple(t.shape)}")
     t = t.float()
     if t.min().item() < 0.0:
         t = (t + 1.0) * 0.5
     if t.shape[-1] == 1:
         t = t.repeat(1,1,1,3)
-    return t.clamp(0,1).contiguous()
+    return t.contiguous()
 
-def _bchw(img_bhwc): return _to_bhwc(img_bhwc).movedim(-1,1).contiguous()
-def _bhwc_from_bchw(x): return x.movedim(1,-1).contiguous()
+def _bchw(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[-1] in (1,3,4):
+        x = x.movedim(-1, 1)
+    return x
 
-def _center_crop_to_square(bchw):
-    _,_,H,W = bchw.shape
-    if H==W: return bchw
-    if H > W:
-        top = (H-W)//2; return bchw[:,:,top:top+W,:]
+def _resize_bchw_smart(x: torch.Tensor, W: int, H: int) -> torch.Tensor:
+    x = _bchw(x)
+    b, c, h, w = x.shape
+    if h==H and w==W:
+        return x
+    out = comfy.utils.common_upscale(x, W, H, upscale_method="lanczos", crop="center")
+    return out
+
+def _ensure_rgb3(x: torch.Tensor) -> torch.Tensor:
+    x = _bchw(x)
+    b, c, h, w = x.shape
+    if c==1:
+        return x.repeat(1,3,1,1)
+    elif c==4:
+        return x[:, :3]
+    elif c==3:
+        return x
     else:
-        left = (W-H)//2; return bchw[:,:,:,left:left+H]
+        raise RuntimeError(f"Unsupported channel count: {c}")
 
-def _resize(bchw, w, h):
-    return comfy.utils.common_upscale(bchw, w, h, "bicubic", "disabled")
+def _get_geometry_tensor(image_bhwc: torch.Tensor) -> torch.Tensor:
+    h, w = int(image_bhwc.shape[1]), int(image_bhwc.shape[2])
+    aspect_ratio = w / h
+    aspect_tensor = torch.tensor(aspect_ratio, dtype=torch.float32)
+    return aspect_tensor
 
-def _desaturate(bchw, amt=0.12):
-    if amt <= 1e-6: return bchw
-    y = bchw[:,0:1]*0.299 + bchw[:,1:2]*0.587 + bchw[:,2:3]*0.114
-    gray = torch.cat([y,y,y], dim=1)
-    return (1.0-amt)*bchw + amt*gray
-
-def _tiers_area(H, W):
-    area = H*W
-    tiers = [int(0.9e6), int(1.2e6), int(1.4e6)]
-    for t in tiers:
-        if area <= t: return H, W
-    s = (tiers[-1]/float(area))**0.5
-    return max(1,int(H*s)), max(1,int(W*s))
-
-# ---------- CLIP proxy that preprocesses VL image ----------
-class _CLIPProxyQwenVL:
-    def __init__(self, base_clip, fixed_size=672, geometry="letterbox",
-                 neutralize=True, desat=0.12, tiers_mode="off", color_mode="grayscale"):
-        self.base = base_clip
-        self.fixed_size = int(fixed_size)
-        self.geometry = geometry  # "center_crop" or "letterbox"
-        self.neutralize = bool(neutralize)
-        self.desat = float(desat)
-        self.tiers_mode = tiers_mode  # "tiers" | "limit" | "off"
-        self.color_mode = color_mode  # "original" | "neutral_gray" | "grayscale"
-
-    def __getattr__(self, name):
-        return getattr(self.base, name)
-
-    def _prep_single(self, img):
-        bhwc = _to_bhwc(img)
-        bchw = _bchw(bhwc)
-        _,_,H,W = bchw.shape
-
-        if self.tiers_mode == "tiers":
-            Ht,Wt = _tiers_area(H,W)
-        elif self.tiers_mode == "limit":
-            maxpix = int(1.4e6)
-            area = H*W
-            if area > maxpix:
-                s = (maxpix/float(area))**0.5
-                Ht,Wt = max(1,int(H*s)), max(1,int(W*s))
-            else:
-                Ht,Wt = H,W
-        else:
-            Ht,Wt = H,W
-
-        if self.geometry == "center_crop":
-            sq = _center_crop_to_square(bchw)
-            bchw2 = _resize(sq, self.fixed_size, self.fixed_size)
-        else:
-            s = min(self.fixed_size/Wt, self.fixed_size/Ht)
-            Wr = max(1,int(round(Wt*s))); Hr = max(1,int(round(Ht*s)))
-            base = _resize(bchw, Wr, Hr)
-            pad_l = (self.fixed_size - Wr)//2
-            pad_r = self.fixed_size - Wr - pad_l
-            pad_t = (self.fixed_size - Hr)//2
-            pad_b = self.fixed_size - Hr - pad_t
-            bchw2 = torch.nn.functional.pad(base, (pad_l,pad_r,pad_t,pad_b),
-                                            mode="constant", value=0.5)  # neutral 50% gray
-
-        # color handling for VL
-        if self.color_mode == "grayscale":
-            y = bchw2[:,0:1]*0.299 + bchw2[:,1:2]*0.587 + bchw2[:,2:3]*0.114
-            bchw2 = torch.cat([y,y,y], dim=1)
-        elif self.color_mode == "neutral_gray":
-            mu = bchw2.mean(dim=(2,3), keepdim=True)
-            bchw2 = (bchw2 - mu) * 0.0 + mu
-
-        if self.neutralize and self.desat > 0 and self.color_mode == "original":
-            bchw2 = _desaturate(bchw2, self.desat)
-
-        return _bhwc_from_bchw(bchw2).clamp(0,1)
-
-    def tokenize(self, prompt, images=None, **kwargs):
-        imgs = images
-        if images is not None and len(images)>0:
-            proc = [self._prep_single(im) for im in images]
-            imgs = proc
-        return self.base.tokenize(prompt, images=imgs, **kwargs)
+def _get_color_bias_tensor(image_bhwc: torch.Tensor) -> torch.Tensor:
+    rgb = _ensure_rgb3(image_bhwc)
+    b, c, h, w = rgb.shape
+    
+    if c == 3:
+        mean_rgb = torch.mean(rgb.view(b, c, -1), dim=2)
+        std_rgb = torch.std(rgb.view(b, c, -1), dim=2)
+        
+        color_bias = torch.cat([
+            mean_rgb,
+            std_rgb
+        ], dim=1)
+    else:
+        color_bias = torch.zeros((b, 2))
+        
+    return color_bias
 
 class QI_QwenVLClipWrapper:
-    CATEGORY = "QI by wallen0322"
-    RETURN_TYPES = ("CLIP",)
-    FUNCTION = "wrap"
-    RETURN_NAMES = ("clip",)
-
+    def __init__(self):
+        pass
+    
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(s):
         return {"required": {
-            "clip": ("CLIP",),
-            "fixed_size": ("INT", {"default": 672, "min": 224, "max": 1024, "step": 224}),
-            "geometry": (["letterbox","center_crop"], {"default": "letterbox"}),
-            "color_mode": (["grayscale","neutral_gray","original"], {"default": "grayscale"}),
-            "neutralize": ("BOOLEAN", {"default": True}),
-            "desaturate": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 0.5, "step": 0.01}),
-            "mp_policy": (["off","limit","tiers"], {"default": "off"}),
+            "images": ("IMAGE",),
+        }, "optional": {
+            "max_pixels": ("INT", {"default": 1400000, "min": 256000, "max": 1400000}),
+            "use_cache": ("BOOLEAN", {"default": True}),
         }}
+    
+    RETURN_TYPES = ("CONDITIONING", "STRING", "STRING")
+    RETURN_NAMES = ("vl_conditioning", "prompt_template", "placeholder_tokens")
+    FUNCTION = "load"
+    CATEGORY = "Qwen2.5"
 
-    def wrap(self, clip, fixed_size=672, geometry="letterbox", color_mode="grayscale",
-             neutralize=True, desaturate=0.12, mp_policy="off"):
-        proxy = _CLIPProxyQwenVL(clip, fixed_size=fixed_size, geometry=geometry,
-                                 neutralize=neutralize, desat=desaturate,
-                                 tiers_mode=mp_policy, color_mode=color_mode)
-        return (proxy,)
+    def load(self, images: torch.Tensor, max_pixels: int = 1400000, use_cache: bool = True):
+        try:
+            images_bhwc = _to_bhwc_any(images)
+            B, H, W, C = images_bhwc.shape
+            
+            if W*H > max_pixels:
+                scale = (max_pixels / (W*H))**0.5
+                new_W = max(8, _round_to(int(W*scale), 8))
+                new_H = max(8, _round_to(int(H*scale), 8))
+                
+                if use_cache:
+                    cache_key = f"vl_load_{W}x{H}_{new_W}x{new_H}_{max_pixels}"
+                    if cache_key in _compute_cache:
+                        cached_result = _compute_cache[cache_key]
+                        vl_conditioning = cached_result[0]
+                        prompt_template = cached_result[1]
+                        placeholder_tokens = cached_result[2]
+                    else:
+                        resized_images = _resize_bchw_smart(_bchw(images_bhwc), new_W, new_H).movedim(1, -1)
+                        
+                        geometry_tensor = _get_geometry_tensor(resized_images)
+                        color_bias_tensor = _get_color_bias_tensor(resized_images)
+                        
+                        vl_conditioning = self._create_vl_conditioning(resized_images, geometry_tensor, color_bias_tensor)
+                        prompt_template = self._create_prompt_template(B)
+                        placeholder_tokens = self._create_placeholder_tokens(B)
+                        
+                        _compute_cache[cache_key] = (vl_conditioning, prompt_template, placeholder_tokens)
+                else:
+                    resized_images = _resize_bchw_smart(_bchw(images_bhwc), new_W, new_H).movedim(1, -1)
+                    
+                    geometry_tensor = _get_geometry_tensor(resized_images)
+                    color_bias_tensor = _get_color_bias_tensor(resized_images)
+                    
+                    vl_conditioning = self._create_vl_conditioning(resized_images, geometry_tensor, color_bias_tensor)
+                    prompt_template = self._create_prompt_template(B)
+                    placeholder_tokens = self._create_placeholder_tokens(B)
+            else:
+                geometry_tensor = _get_geometry_tensor(images_bhwc)
+                color_bias_tensor = _get_color_bias_tensor(images_bhwc)
+                
+                if use_cache:
+                    cache_key = f"vl_load_{W}x{H}_{max_pixels}"
+                    if cache_key in _compute_cache:
+                        cached_result = _compute_cache[cache_key]
+                        vl_conditioning = cached_result[0]
+                        prompt_template = cached_result[1]
+                        placeholder_tokens = cached_result[2]
+                    else:
+                        vl_conditioning = self._create_vl_conditioning(images_bhwc, geometry_tensor, color_bias_tensor)
+                        prompt_template = self._create_prompt_template(B)
+                        placeholder_tokens = self._create_placeholder_tokens(B)
+                        
+                        _compute_cache[cache_key] = (vl_conditioning, prompt_template, placeholder_tokens)
+                else:
+                    vl_conditioning = self._create_vl_conditioning(images_bhwc, geometry_tensor, color_bias_tensor)
+                    prompt_template = self._create_prompt_template(B)
+                    placeholder_tokens = self._create_placeholder_tokens(B)
+            
+            return (vl_conditioning, prompt_template, placeholder_tokens)
+            
+        except Exception as e:
+            raise RuntimeError(f"VL loading failed: {e}")
 
-NODE_CLASS_MAPPINGS = {"QI_QwenVLClipWrapper": QI_QwenVLClipWrapper}
-NODE_DISPLAY_NAME_MAPPINGS = {"QI_QwenVLClipWrapper": "Qwen 2.5 VL 专用加载器（包装） — by wallen0322"}
+    def _create_vl_conditioning(self, images_bhwc: torch.Tensor, geometry_tensor: torch.Tensor, color_bias_tensor: torch.Tensor):
+        vl_conditioning = {
+            "images": images_bhwc,
+            "geometry": geometry_tensor,
+            "color_bias": color_bias_tensor
+        }
+        return vl_conditioning
+
+    def _create_prompt_template(self, B: int) -> str:
+        placeholders = []
+        for i in range(B):
+            placeholders.append(f"<image_{i}>")
+        return " ".join(placeholders)
+
+    def _create_placeholder_tokens(self, B: int) -> str:
+        tokens = []
+        for i in range(B):
+            tokens.append(f"<image_{i}>")
+        return " ".join(tokens)
