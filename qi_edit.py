@@ -199,7 +199,7 @@ class QI_TextEncodeQwenImageEdit_Safe:
         lat_end   = 0.36 if emph >= 0.7 else 0.40
         pix_early = [0.30, 0.58]    # low-pass pixel
         pix_mid   = [0.45, 0.75]    # base pixel
-        pix_late  = [0.82, 1.00]    # HF pixel
+        pix_late  = [0.82, 0.96]    # HF pixel - stop before final steps to avoid blocking
 
         # strengths (auto-tune with emph & complexity)
         w_lat   = lat_w
