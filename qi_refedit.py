@@ -8,6 +8,41 @@ _ALIGN_M = 32
 _SAFE_MAX_PIX = 3_000_000
 _VL_MAX_PIX = 1_400_000
 
+def _smart_align(v: int, prefer: int = 16, fallback: int = 8) -> int:
+    if v < fallback:
+        return fallback
+    
+    v_prefer = ((v + prefer - 1) // prefer) * prefer
+    v_fallback = ((v + fallback - 1) // fallback) * fallback
+    
+    if abs(v_prefer - v) <= prefer // 2:
+        return v_prefer
+    return v_fallback
+
+def _compute_dimensions(input_w: int, input_h: int, out_w: int, out_h: int, max_pix: int = _SAFE_MAX_PIX):
+    target_w = out_w if out_w > 0 else input_w
+    target_h = out_h if out_h > 0 else input_h
+    
+    area = target_w * target_h
+    if area > max_pix:
+        scale = (max_pix / float(area)) ** 0.5
+        target_w = int(target_w * scale)
+        target_h = int(target_h * scale)
+    
+    work_w = _smart_align(target_w, 16, 8)
+    work_h = _smart_align(target_h, 16, 8)
+    
+    pad_w = _ceil_to(work_w, _ALIGN_M)
+    pad_h = _ceil_to(work_h, _ALIGN_M)
+    
+    scale = min(work_w / float(input_w), work_h / float(input_h))
+    letter_w = _smart_align(int(input_w * scale), 16, 8)
+    letter_h = _smart_align(int(input_h * scale), 16, 8)
+    letter_w = min(letter_w, work_w)
+    letter_h = min(letter_h, work_h)
+    
+    return work_w, work_h, pad_w, pad_h, letter_w, letter_h
+
 def _ceil_to(v: int, m: int) -> int:
     return ((v + m - 1) // m) * m if m > 1 else v
 
@@ -73,59 +108,29 @@ def _resize_bchw_smart(x: torch.Tensor, w: int, h: int):
     _,_,H,W = x.shape
     return _resize_bchw(x, w, h, _choose_method(W,H,w,h))
 
-def _align_dimensions(W: int, H: int, max_pix: int = _SAFE_MAX_PIX):
-    area = W * H
-    if area > max_pix:
-        s = (max_pix / float(area)) ** 0.5
-        W = int(W * s)
-        H = int(H * s)
+def _letterbox_to_size(src_bhwc: torch.Tensor, letter_w: int, letter_h: int, work_w: int, work_h: int, pad_mode: str="reflect"):
+    B, H, W, C = src_bhwc.shape
     
-    W_112 = _round_to(W, 112)
-    H_112 = _round_to(H, 112)
-    if abs(W_112 - W) <= 56 and abs(H_112 - H) <= 56:
-        W, H = W_112, H_112
+    if W == letter_w and H == letter_h and work_w == letter_w and work_h == letter_h:
+        return src_bhwc, dict(top=0, bottom=0, left=0, right=0)
     
-    W_64 = _round_to(W, 64)
-    H_64 = _round_to(H, 64)
-    if abs(W_64 - W) <= 32 and abs(H_64 - H) <= 32:
-        W, H = W_64, H_64
+    base = _ensure_rgb3(_resize_bchw_smart(_bchw(src_bhwc), letter_w, letter_h).movedim(1, -1))
     
-    W = _ceil_to(max(8, W), 8)
-    H = _ceil_to(max(8, H), 8)
+    top = (work_h - letter_h) // 2
+    bottom = work_h - letter_h - top
+    left = (work_w - letter_w) // 2
+    right = work_w - letter_w - left
     
-    return W, H
-
-def _letterbox(src_bhwc: torch.Tensor, Wt: int, Ht: int, pad_mode: str="reflect"):
-    B,H,W,C = src_bhwc.shape
-    if W==Wt and H==Ht:
-        return src_bhwc, dict(top=0,bottom=0,left=0,right=0)
-    s = min(Wt/float(W), Ht/float(H))
-    Wr = max(1, int(round(W*s)))
-    Hr = max(1, int(round(H*s)))
-    Wr = _round_to(Wr, 8)
-    Hr = _round_to(Hr, 8)
-    Wr = max(8, min(Wr, Wt))
-    Hr = max(8, min(Hr, Ht))
-    
-    base = _ensure_rgb3(_resize_bchw_smart(_bchw(src_bhwc), Wr, Hr).movedim(1,-1))
-    top = (Ht - Hr)//2
-    bottom = Ht - Hr - top
-    left = (Wt - Wr)//2
-    right = Wt - Wr - left
-    
-    top = (top // 2) * 2
-    bottom = Ht - Hr - top
-    left = (left // 2) * 2
-    right = Wt - Wr - left
-    
-    bchw = _bchw(base)
-    if top>0 or bottom>0 or left>0 or right>0:
-        h, w = int(bchw.shape[2]), int(bchw.shape[3])
+    if top > 0 or bottom > 0 or left > 0 or right > 0:
+        bchw = _bchw(base)
+        h, w = bchw.shape[2], bchw.shape[3]
         mode = pad_mode
         if h < 2 or w < 2 or left >= w or right >= w or top >= h or bottom >= h:
             mode = "replicate"
-        bchw = F.pad(bchw, (left,right,top,bottom), mode=mode)
-    return _ensure_rgb3(bchw.movedim(1,-1)), dict(top=int(top),bottom=int(bottom),left=int(left),right=int(right))
+        bchw = F.pad(bchw, (left, right, top, bottom), mode=mode)
+        base = _ensure_rgb3(bchw.movedim(1, -1))
+    
+    return base, dict(top=int(top), bottom=int(bottom), left=int(left), right=int(right))
 
 def _smoothstep(a: float, b: float, x: torch.Tensor) -> torch.Tensor:
     t = (x - a) / max(1e-6, (b - a))
@@ -207,7 +212,7 @@ def _apply_chroma_stats(Cbx, Crx, Cbr, Crr, Yx):
     dmu_cr = dmu_cr * k
     return (t00,t01,t10,t11), (dmu_cb,dmu_cr), (mu_x_cb,mu_x_cr)
 
-def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.97) -> torch.Tensor:
+def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.985) -> torch.Tensor:
     x = _bchw(x_bhwc); r = _bchw(ref_bhwc)
     x_lin = _srgb_to_linear(x); r_lin = _srgb_to_linear(r)
     R,G,B   = x_lin[:,0:1], x_lin[:,1:2], x_lin[:,2:3]
@@ -232,6 +237,11 @@ def _color_lock_to(x_bhwc: torch.Tensor, ref_bhwc: torch.Tensor, mix: float=0.97
     out_lin = w*aligned + (1.0 - w)*x_lin
     out = _linear_to_srgb(out_lin).movedim(1,-1)
     return _ensure_rgb3(out)
+
+def _simple_downsample(bchw: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+    target_w = _smart_align(target_w, 16, 8)
+    target_h = _smart_align(target_h, 16, 8)
+    return _resize_bchw(bchw, target_w, target_h, "area")
 
 def _lowpass_ref(bhwc: torch.Tensor, size: int=64) -> torch.Tensor:
     bchw = _bchw(bhwc)
@@ -268,36 +278,210 @@ def _hf_ref_smart(bhwc: torch.Tensor, alpha: float, blur_k: int, kstd: float, bi
     out = (bchw + alpha*(dm*gate3)).clamp(0,1)
     return _ensure_rgb3(out.movedim(1,-1))
 
-def _gradual_downsample(bchw: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
-    current_h, current_w = bchw.shape[2], bchw.shape[3]
+QUALITY_CONFIGS = {
+    "fast": {
+        "lat_e": 0.65, "pixM_e": 0.38, "pixE_e": 0.15,
+        "lat_l": 0.92, "pixM_l": 0.75, "pixL_l": 0.016,
+        "hf_alpha": 0.13, "kstd": 0.80, "bias": 0.0048
+    },
+    "best": {
+        "lat_e": 0.72, "pixM_e": 0.48, "pixE_e": 0.19,
+        "lat_l": 1.08, "pixM_l": 0.92, "pixL_l": 0.022,
+        "hf_alpha": 0.16, "kstd": 0.88, "bias": 0.0045
+    },
+    "balanced": {
+        "lat_e": 0.68, "pixM_e": 0.44, "pixE_e": 0.17,
+        "lat_l": 1.00, "pixM_l": 0.85, "pixL_l": 0.019,
+        "hf_alpha": 0.15, "kstd": 0.85, "bias": 0.0046
+    },
+    "natural": {
+        "lat_e": 0.70, "pixM_e": 0.45, "pixE_e": 0.17,
+        "lat_l": 1.05, "pixM_l": 0.88, "pixL_l": 0.020,
+        "hf_alpha": 0.14, "kstd": 0.82, "bias": 0.005
+    }
+}
+
+def _prepare_reference_images(images_in, vae):
+    images_vl = []
+    ref_latents = []
+    image_prompt = ""
     
-    kernel_size = 3
-    sigma = 0.5
-    kernel = torch.zeros((3, 1, kernel_size, kernel_size), device=bchw.device, dtype=bchw.dtype)
-    center = kernel_size // 2
-    total = 0.0
-    for i in range(kernel_size):
-        for j in range(kernel_size):
-            val = torch.exp(torch.tensor(-((i - center) ** 2 + (j - center) ** 2) / (2 * sigma ** 2)))
-            kernel[:, :, i, j] = val
-            total += val
-    kernel = kernel / total
+    for i, im in enumerate(images_in):
+        if im is None:
+            continue
+        im_bhwc = _bhwc(im)[...,:3]
+        samples = im_bhwc.movedim(-1, 1)
+        Hs, Ws = samples.shape[2], samples.shape[3]
+        
+        total = int(384 * 384)
+        scale_by = (total / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
+        width  = _smart_align(max(8, int(round(Ws * scale_by))), 16, 8)
+        height = _smart_align(max(8, int(round(Hs * scale_by))), 16, 8)
+        s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
+        images_vl.append(s.movedim(1, -1))
+        
+        if vae is not None:
+            total_l = int(1024 * 1024)
+            scale_by_l = (total_l / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
+            width_l  = _smart_align(max(8, int(round(Ws * scale_by_l))), 16, 8)
+            height_l = _smart_align(max(8, int(round(Hs * scale_by_l))), 16, 8)
+            s_l = comfy.utils.common_upscale(samples, width_l, height_l, "area", "disabled")
+            ref_latents.append(vae.encode(s_l.movedim(1,-1)[:, :, :, :3]))
+        
+        image_prompt += f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>"
     
-    bchw_blur = F.conv2d(F.pad(bchw, (1, 1, 1, 1), mode='replicate'), kernel, groups=3)
+    return images_vl, ref_latents, image_prompt
+
+def _adjust_params_for_mode(cfg, emph, is_multi_image):
+    params = cfg.copy()
     
-    current = bchw_blur
-    while current_w > target_w * 2 or current_h > target_h * 2:
-        new_w = max(target_w, current_w // 2)
-        new_h = max(target_h, current_h // 2)
-        new_w = _round_to(new_w, 8)
-        new_h = _round_to(new_h, 8)
-        current = _resize_bchw(current, new_w, new_h, "area")
-        current_w, current_h = new_w, new_h
+    if is_multi_image:
+        ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
+        e_mult = max(0.50, min(1.10, 1.0 - 0.65 * emph))
+        l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))
+        
+        params["pixM_e"] *= ref_scale * 0.92 * 0.85 * e_mult
+        params["pixM_l"] *= ref_scale * 0.95 * l_mult
+        params["pixE_e"] *= ref_scale * e_mult * 0.90
+        params["pixL_l"] *= 0.95 * l_mult
+    else:
+        ref_scale = max(0.75, min(1.03, 1.03 - 0.28*emph))
+        e_mult = max(0.75, min(1.05, 1.0 - 0.35 * emph))
+        l_mult = max(0.85, min(1.08, 0.88 + 0.20 * (1.0 - emph)))
+        
+        params["pixM_e"] *= ref_scale * 0.85 * e_mult
+        params["pixM_l"] *= ref_scale * l_mult
+        params["pixE_e"] *= ref_scale * e_mult
+        params["pixL_l"] *= 0.95 * l_mult
     
-    if current_w != target_w or current_h != target_h:
-        current = _resize_bchw(current, target_w, target_h, "area")
+    return params
+
+def _build_reference_pixels(padded, params, is_multi_image):
+    pixM = pixE = pixL = None
     
-    return current
+    if is_multi_image:
+        bchw_padded = _bchw(padded)
+        Ph, Pw = bchw_padded.shape[2], bchw_padded.shape[3]
+        total_pix_target = int(1024 * 1024)
+        scale_for_ref = (total_pix_target / float(Pw * Ph)) ** 0.5
+        Pw_ref = max(8, int(round(Pw * scale_for_ref)))
+        Ph_ref = max(8, int(round(Ph * scale_for_ref)))
+        
+        padded_ref_bchw = _simple_downsample(bchw_padded, Pw_ref, Ph_ref)
+        padded_ref = _ensure_rgb3(padded_ref_bchw.movedim(1, -1)).clamp(0, 1)
+        
+        if params["pixM_e"]>0 or params["pixM_l"]>0:
+            pixM = _color_lock_to(padded_ref, padded_ref, mix=0.92)
+        if params["pixE_e"]>0:
+            pixE = _color_lock_to(_lowpass_ref(padded_ref, 64), padded_ref, mix=0.90)
+    else:
+        if params["pixM_e"]>0 or params["pixM_l"]>0:
+            pixM = _color_lock_to(padded, padded, mix=0.985)
+        if params["pixE_e"]>0:
+            pixE = _color_lock_to(_lowpass_ref(padded, 64), padded, mix=0.99)
+        if params["pixL_l"]>0:
+            pixL = _color_lock_to(_hf_ref_smart(padded, params["hf_alpha"], 3, params["kstd"], params["bias"], 5), padded, mix=0.975)
+    
+    return pixM, pixE, pixL
+
+def _add_references(cond, lat, refs, params, is_multi_image):
+    pixM, pixE, pixL = refs
+    
+    if is_multi_image:
+        ranges = {"early": (0.0, 0.6), "late": (0.6, 1.0)}
+        pixE_e_val = params["pixE_e"] * 0.70
+        if pixE is not None and pixE_e_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixE],
+                "strength": float(min(pixE_e_val, 1.0)),
+                "timestep_percent_range": [ranges["early"][0], ranges["early"][1]],
+            }, append=True)
+        lat_l_val = params["lat_l"] * 0.75
+        pixM_l_val = params["pixM_l"] * 1.05
+        if lat_l_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_latents": [lat],
+                "strength": float(min(lat_l_val, 1.0)),
+                "timestep_percent_range": [ranges["late"][0], ranges["late"][1]],
+            }, append=True)
+        if pixM is not None and pixM_l_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixM],
+                "strength": float(min(pixM_l_val, 1.0)),
+                "timestep_percent_range": [ranges["late"][0], ranges["late"][1]],
+            }, append=True)
+    else:
+        ranges = {"early": (0.0, 0.35), "mid": (0.35, 0.75), "late": (0.75, 1.0)}
+        lat_e_val = params["lat_e"] * 0.65
+        pixE_e_val = params["pixE_e"] * 0.90
+        pixM_e_val = params["pixM_e"] * 0.75
+        
+        if lat_e_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_latents": [lat],
+                "strength": float(min(lat_e_val, 1.0)),
+                "timestep_percent_range": [ranges["early"][0], ranges["early"][1]],
+            }, append=True)
+        if pixE is not None and pixE_e_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixE],
+                "strength": float(min(pixE_e_val, 1.0)),
+                "timestep_percent_range": [ranges["early"][0], ranges["early"][1]],
+            }, append=True)
+        if pixM is not None and pixM_e_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixM],
+                "strength": float(min(pixM_e_val, 1.0)),
+                "timestep_percent_range": [ranges["early"][0], ranges["early"][1]],
+            }, append=True)
+        
+        lat_m_val = params["lat_l"] * 0.85
+        pixM_m_val = params["pixM_l"] * 1.00
+        pixL_m_val = params["pixL_l"] * 0.85
+        
+        if lat_m_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_latents": [lat],
+                "strength": float(min(lat_m_val, 1.0)),
+                "timestep_percent_range": [ranges["mid"][0], ranges["mid"][1]],
+            }, append=True)
+        if pixM is not None and pixM_m_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixM],
+                "strength": float(min(pixM_m_val, 1.0)),
+                "timestep_percent_range": [ranges["mid"][0], ranges["mid"][1]],
+            }, append=True)
+        if pixL is not None and pixL_m_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixL],
+                "strength": float(min(pixL_m_val, 1.0)),
+                "timestep_percent_range": [ranges["mid"][0], ranges["mid"][1]],
+            }, append=True)
+        
+        lat_l_val = params["lat_l"] * 0.85
+        pixM_l_val = params["pixM_l"] * 1.15
+        pixL_l_val = params["pixL_l"] * 1.30
+        
+        if lat_l_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_latents": [lat],
+                "strength": float(min(lat_l_val, 1.0)),
+                "timestep_percent_range": [ranges["late"][0], ranges["late"][1]],
+            }, append=True)
+        if pixM is not None and pixM_l_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixM],
+                "strength": float(min(pixM_l_val, 1.0)),
+                "timestep_percent_range": [ranges["late"][0], ranges["late"][1]],
+            }, append=True)
+        if pixL is not None and pixL_l_val > 0.01:
+            cond = node_helpers.conditioning_set_values(cond, {
+                "reference_pixels": [pixL],
+                "strength": float(min(pixL_l_val, 1.0)),
+                "timestep_percent_range": [ranges["late"][0], ranges["late"][1]],
+            }, append=True)
+    
+    return cond
 
 class QI_RefEditEncode_Safe:
     CATEGORY = "QI by wallen0322"
@@ -314,202 +498,100 @@ class QI_RefEditEncode_Safe:
             "vae": ("VAE",),
             "out_width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
             "out_height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 8}),
-            "prompt_emphasis": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "prompt_emphasis": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             "quality_mode": (["natural","fast","balanced","best"], {"default": "natural"}),
+            "brightness_boost": ("FLOAT", {"default": 1.0, "min": 0.8, "max": 1.3, "step": 0.01}),
+            "debug_info": ("BOOLEAN", {"default": False}),
         },
         "optional": {
             "image2": ("IMAGE",),
             "image3": ("IMAGE",)
         }}
 
-    def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.6, quality_mode="natural", image2=None, image3=None):
+    def encode(self, clip, prompt, image, vae, out_width=0, out_height=0, prompt_emphasis=0.5, quality_mode="natural", brightness_boost=1.0, debug_info=False, image2=None, image3=None):
         src = _bhwc(image)[...,:3]
-        H,W = int(src.shape[1]), int(src.shape[2])
-        Wt = int(out_width) if int(out_width)>0 else W
-        Ht = int(out_height) if int(out_height)>0 else H
-
-        Wt, Ht = _align_dimensions(Wt, Ht, _SAFE_MAX_PIX)
-        Wc = _ceil_to(Wt, _ALIGN_M)
-        Hc = _ceil_to(Ht, _ALIGN_M)
-
-        letter, ext = _letterbox(src, Wt, Ht, pad_mode="reflect")
-        top,left,bottom,right = ext["top"],ext["left"],ext["bottom"],ext["right"]
-        ph, pw = Hc - Ht, Wc - Wt
-        if ph>0 or pw>0:
-            t2 = (ph//2 // 2) * 2
+        H, W = int(src.shape[1]), int(src.shape[2])
+        
+        work_w, work_h, pad_w, pad_h, letter_w, letter_h = _compute_dimensions(W, H, int(out_width), int(out_height), _SAFE_MAX_PIX)
+        
+        letter, ext = _letterbox_to_size(src, letter_w, letter_h, work_w, work_h, pad_mode="reflect")
+        top, left, bottom, right = ext["top"], ext["left"], ext["bottom"], ext["right"]
+        
+        ph, pw = pad_h - work_h, pad_w - work_w
+        if ph > 0 or pw > 0:
+            t2 = ph // 2
             b2 = ph - t2
-            l2 = (pw//2 // 2) * 2
+            l2 = pw // 2
             r2 = pw - l2
             bchw = _bchw(letter)
-            h, w = int(bchw.shape[2]), int(bchw.shape[3])
+            h, w = bchw.shape[2], bchw.shape[3]
             _mode = "reflect"
             if h < 2 or w < 2 or l2 >= w or r2 >= w or t2 >= h or b2 >= h:
                 _mode = "replicate"
-            bchw = F.pad(bchw, (l2,r2,t2,b2), mode=_mode)
-            letter = _ensure_rgb3(bchw.movedim(1,-1))
-            top+=t2; bottom+=b2; left+=l2; right+=r2
-        padded = letter.contiguous()
-
-        images_vl = []
-        ref_latents = []
-        images_in = [image, image2, image3]
-        image_prompt = ""
-        num_images = sum(1 for im in images_in if im is not None)
+            bchw = F.pad(bchw, (l2, r2, t2, b2), mode=_mode)
+            letter = _ensure_rgb3(bchw.movedim(1, -1))
+            top += t2
+            bottom += b2
+            left += l2
+            right += r2
         
-        for i, im in enumerate(images_in):
-            if im is None:
-                continue
-            im_bhwc = _bhwc(im)[...,:3]
-            samples = im_bhwc.movedim(-1, 1)
-            total = int(384 * 384)
-            Hs, Ws = samples.shape[2], samples.shape[3]
-            scale_by = (total / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
-            width  = _round_to(max(8, int(round(Ws * scale_by))), 8)
-            height = _round_to(max(8, int(round(Hs * scale_by))), 8)
-            s = comfy.utils.common_upscale(samples, width, height, "area", "disabled")
-            images_vl.append(s.movedim(1, -1))
-            if vae is not None:
-                total_l = int(1024 * 1024)
-                scale_by_l = (total_l / float(Ws*Hs)) ** 0.5 if (Ws*Hs)>0 else 1.0
-                width_l  = _round_to(max(8, int(round(Ws * scale_by_l))), 8)
-                height_l = _round_to(max(8, int(round(Hs * scale_by_l))), 8)
-                s_l = comfy.utils.common_upscale(samples, width_l, height_l, "area", "disabled")
-                ref_latents.append(vae.encode(s_l.movedim(1,-1)[:, :, :, :3]))
-            image_prompt += f"Picture {i+1}: <|vision_start|><|image_pad|><|vision_end|>"
+        padded = letter.contiguous()
+        
+        images_in = [image, image2, image3]
+        num_images = sum(1 for im in images_in if im is not None)
+        is_multi_image = num_images > 1
+        
+        images_vl, ref_latents, image_prompt = _prepare_reference_images(images_in, vae)
         
         chat = "<|im_start|>user\n" + image_prompt + (prompt if isinstance(prompt,str) else str(prompt)) + "\n<|im_end|>\n<|im_start|>assistant\n"
         tokens = clip.tokenize(chat, images=images_vl)
         cond = clip.encode_from_tokens_scheduled(tokens)
+        
         if len(ref_latents) > 0:
             cond = node_helpers.conditioning_set_values(cond, {"reference_latents": ref_latents}, append=True)
-
-        with torch.inference_mode():
-            lat = vae.encode(padded)
-            if isinstance(lat, dict) and "samples" in lat: lat = lat["samples"]
-            if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: lat = lat.float()
-
-        is_multi_image = num_images > 1
-        emph = float(max(0.0, min(1.0, prompt_emphasis)))
         
-        if quality_mode == "fast":
-            lat_e, pixM_e, pixE_e = 0.65, 0.38, 0.15
-            lat_l, pixM_l, pixL_l = 0.92, 0.75, 0.016
-            hf_alpha, kstd, bias = 0.13, 0.80, 0.0048
-        elif quality_mode == "best":
-            lat_e, pixM_e, pixE_e = 0.72, 0.48, 0.19
-            lat_l, pixM_l, pixL_l = 1.08, 0.92, 0.022
-            hf_alpha, kstd, bias = 0.16, 0.88, 0.0045
-        elif quality_mode == "balanced":
-            lat_e, pixM_e, pixE_e = 0.68, 0.44, 0.17
-            lat_l, pixM_l, pixL_l = 1.00, 0.85, 0.019
-            hf_alpha, kstd, bias = 0.15, 0.85, 0.0046
-        else:
-            lat_e, pixM_e, pixE_e = 0.70, 0.45, 0.17
-            lat_l, pixM_l, pixL_l = 1.05, 0.88, 0.020
-            hf_alpha, kstd, bias = 0.14, 0.82, 0.005
-
-        if is_multi_image:
-            ref_scale = max(0.70, min(1.05, 1.05 - 0.35*emph))
-            e_mult = max(0.50, min(1.10, 1.0 - 0.65 * emph))
-            l_mult = max(0.75, min(1.10, 0.78 + 0.35 * (1.0 - emph)))
-            
-            pixM_e *= ref_scale * 0.92
-            pixM_l *= ref_scale * 0.95
-            pixE_e *= ref_scale
-            pixE_e *= e_mult * 0.90
-            pixM_e *= 0.85 * e_mult
-            pixM_l *= l_mult
-            pixL_l *= 0.95 * l_mult
-            
-            bchw_padded = _bchw(padded)
-            Ph, Pw = bchw_padded.shape[2], bchw_padded.shape[3]
-            total_pix_target = int(1024 * 1024)
-            scale_for_ref = (total_pix_target / float(Pw * Ph)) ** 0.5
-            Pw_ref = _round_to(max(8, int(round(Pw * scale_for_ref))), 8)
-            Ph_ref = _round_to(max(8, int(round(Ph * scale_for_ref))), 8)
-            
-            padded_ref_bchw = _gradual_downsample(bchw_padded, Pw_ref, Ph_ref)
-            padded_ref = padded_ref_bchw.movedim(1, -1)
-            padded_ref = _ensure_rgb3(padded_ref).clamp(0, 1)
-            
-            pixM = padded_ref if (pixM_e>0 or pixM_l>0) else None
-            pixE = _lowpass_ref(padded_ref, 64) if pixE_e>0 else None
-            pixL = None
-            
-            if pixM is not None:
-                pixM_processed = pixM.clamp(0, 1)
-                pixM = _color_lock_to(pixM_processed, padded_ref, mix=0.92)
-            if pixE is not None:
-                pixE_processed = pixE.clamp(0, 1)
-                pixE = _color_lock_to(pixE_processed, padded_ref, mix=0.90)
-        else:
-            ref_scale = max(0.75, min(1.03, 1.03 - 0.28*emph))
-            e_mult = max(0.75, min(1.05, 1.0 - 0.35 * emph))
-            l_mult = max(0.85, min(1.08, 0.88 + 0.20 * (1.0 - emph)))
-            
-            pixM_e *= ref_scale
-            pixM_l *= ref_scale
-            pixE_e *= ref_scale
-            pixE_e *= e_mult
-            pixM_e *= 0.85 * e_mult
-            pixM_l *= l_mult
-            pixL_l *= 0.95 * l_mult
-            
-            pixM = padded if (pixM_e>0 or pixM_l>0) else None
-            pixE = _lowpass_ref(padded, 64) if pixE_e>0 else None
-            pixL = _hf_ref_smart(padded, hf_alpha, 3, kstd, bias, 5) if pixL_l>0 else None
-            
-            if pixM is not None: pixM = _color_lock_to(pixM, padded, mix=0.985)
-            if pixE is not None: pixE = _color_lock_to(pixE, padded, mix=0.99)
-            if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.975)
-
-        if is_multi_image:
-            early = (0.0, 0.6); late = (0.6, 0.96); hf_rng = (0.92, 0.96)
-        else:
-            early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 0.96); hf_rng = (0.92, 0.96)
-
-        def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
-            c = node_helpers.conditioning_set_values(c, {
-                "reference_latents": [lat],
-                "strength": float(lat_w),
-                "timestep_percent_range": [float(rng[0]), float(rng[1])],
-            }, append=True)
-            if pixE is not None and pixE_w>0:
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixE],
-                    "strength": float(pixE_w),
-                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                }, append=True)
-            if pixM is not None and pixM_w>0:
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixM],
-                    "strength": float(pixM_w),
-                    "timestep_percent_range": [float(rng[0]), float(rng[1])],
-                }, append=True)
-            if pixL is not None and pixL_w>0:
-                r = hfr if hfr is not None else rng
-                c = node_helpers.conditioning_set_values(c, {
-                    "reference_pixels": [pixL],
-                    "strength": float(pixL_w),
-                    "timestep_percent_range": [float(r[0]), float(r[1])],
-                }, append=True)
-            return c
-
-        if is_multi_image:
-            lat_l_enh  = float(lat_l * 1.05)
-            pixM_l_enh = float(pixM_l * 0.80)
-            pixE_e_safe = float(pixE_e * 0.70)
-            cond = _add_ref(cond, early, 0.0, pixE_e_safe, 0.0, 0.0, None)
-            cond = _add_ref(cond, late, lat_l_enh, 0.0, pixM_l_enh, 0.0, hf_rng)
-        else:
-            cond = _add_ref(cond, early, lat_e*0.70, pixE_e*0.85, pixM_e*0.65, 0.0, None)
-            cond = _add_ref(cond, mid, lat_l*0.95, 0.0, pixM_l*0.90, pixL_l*0.80, None)
-            cond = _add_ref(cond, late, lat_l*1.15, 0.0, pixM_l*1.00, pixL_l*1.20, hf_rng)
-
-        latent = {"samples": lat,
-                  "qi_pad": {"top": int(top), "bottom": int(bottom), "left": int(left), "right": int(right),
-                             "orig_h": int(Ht), "orig_w": int(Wt),
-                             "compute_h": int(padded.shape[1]), "compute_w": int(padded.shape[2])}}
+        padded_for_vae = padded
+        if brightness_boost != 1.0:
+            gamma = 1.0 / brightness_boost
+            padded_for_vae = torch.pow(padded.clamp(0, 1), gamma).clamp(0, 1)
+        
+        with torch.inference_mode():
+            lat = vae.encode(padded_for_vae)
+            if isinstance(lat, dict) and "samples" in lat: 
+                lat = lat["samples"]
+            if isinstance(lat, torch.Tensor) and lat.dtype != torch.float32: 
+                lat = lat.float()
+        
+        cfg = QUALITY_CONFIGS[quality_mode]
+        emph = float(max(0.0, min(1.0, prompt_emphasis)))
+        params = _adjust_params_for_mode(cfg, emph, is_multi_image)
+        
+        pixM, pixE, pixL = _build_reference_pixels(padded, params, is_multi_image)
+        
+        cond = _add_references(cond, lat, (pixM, pixE, pixL), params, is_multi_image)
+        
+        if debug_info:
+            print(f"\n=== Qwen Edit Debug ===")
+            print(f"Input: {W}x{H} → Work: {work_w}x{work_h} → Pad: {pad_w}x{pad_h}")
+            print(f"Letter: {letter_w}x{letter_h}")
+            print(f"Mode: {'Multi' if is_multi_image else 'Single'} ({num_images} imgs)")
+            print(f"Quality: {quality_mode}, Emphasis: {emph:.2f}, Brightness: {brightness_boost:.2f}")
+            print(f"Params: lat_e={params['lat_e']:.2f} lat_l={params['lat_l']:.2f}")
+            print(f"        pixM_e={params['pixM_e']:.2f} pixM_l={params['pixM_l']:.2f}")
+            print(f"        pixE_e={params['pixE_e']:.2f} pixL_l={params['pixL_l']:.2f}")
+            print(f"Refs: M={'Y' if pixM is not None else 'N'} E={'Y' if pixE is not None else 'N'} L={'Y' if pixL is not None else 'N'}")
+            print(f"======================\n")
+        
+        latent = {
+            "samples": lat,
+            "qi_pad": {
+                "top": int(top), "bottom": int(bottom), 
+                "left": int(left), "right": int(right),
+                "orig_h": int(work_h), "orig_w": int(work_w),
+                "compute_h": int(padded.shape[1]), "compute_w": int(padded.shape[2])
+            }
+        }
+        
         return (cond, _ensure_rgb3(_bhwc(image)), latent)
 
 NODE_CLASS_MAPPINGS = {"QI_RefEditEncode_Safe": QI_RefEditEncode_Safe}
