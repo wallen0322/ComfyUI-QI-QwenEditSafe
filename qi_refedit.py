@@ -464,9 +464,9 @@ class QI_RefEditEncode_Safe:
             if pixL is not None: pixL = _color_lock_to(pixL, padded, mix=0.975)
 
         if is_multi_image:
-            early = (0.0, 0.6); late = (0.6, 1.0); hf_rng = (0.985, 1.0)
+            early = (0.0, 0.6); late = (0.6, 0.96); hf_rng = (0.92, 0.96)
         else:
-            early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 1.0); hf_rng = (0.985, 1.0)
+            early = (0.0, 0.35); mid = (0.35, 0.75); late = (0.75, 0.96); hf_rng = (0.92, 0.96)
 
         def _add_ref(c, rng, lat_w, pixE_w, pixM_w, pixL_w, hfr=None):
             c = node_helpers.conditioning_set_values(c, {
