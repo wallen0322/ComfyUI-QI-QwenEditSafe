@@ -53,5 +53,25 @@
     "outputs": {
       "0": { "name": "图像", "tooltip": "解码后的图像（自动裁回原尺寸）" }
     }
+  },
+  "QI_DyPE": {
+    "display_name": "Qwen 图像 DyPE — 超高分辨率 — by wallen0322",
+    "category": "QI by wallen0322",
+    "inputs": {
+      "model": { "name": "模型", "tooltip": "Qwen-Image 扩散模型" },
+      "mode": { "name": "模式", "tooltip": "T2I（文生图）或 Edit（图像编辑，带细节保护）" },
+      "preset": { "name": "预设分辨率", "tooltip": "快速选择常用分辨率（Custom 为自定义）" },
+      "custom_width": { "name": "自定义宽度", "tooltip": "仅当 preset=Custom 时生效，512-8192" },
+      "custom_height": { "name": "自定义高度", "tooltip": "仅当 preset=Custom 时生效，512-8192" },
+      "method": { "name": "缩放方法", "tooltip": "yarn（推荐）/ ntk（平衡）/ base（禁用DyPE）" },
+      "enable_dype": { "name": "启用 DyPE", "tooltip": "启用动态位置外推，关闭则使用静态缩放" },
+      "dype_exponent": { "name": "动态指数", "tooltip": "控制动态强度：1.0-1.5（2K以下）/ 1.5-2.0（2-4K）/ 2.0+（4K以上）" },
+      "preserve_detail": { "name": "细节保留", "tooltip": "Edit 模式专用，控制细节保护程度（0.0-1.0）" }
+    },
+    "outputs": {
+      "0": { "name": "模型", "tooltip": "应用 DyPE 后的模型" },
+      "1": { "name": "宽度", "tooltip": "实际输出宽度（需与 Latent 保持一致）" },
+      "2": { "name": "高度", "tooltip": "实际输出高度（需与 Latent 保持一致）" }
+    }
   }
 }
